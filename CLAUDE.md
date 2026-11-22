@@ -25,6 +25,14 @@ liq2sol (`~/src/liq2sol`).
 - Public repo: https://github.com/SwapMarket/liq2any (`origin`, branch `main`), created on 2026-11-22 (user's decision).
 - Show the user screenshots of visual changes before committing them.
 
+## Status
+
+- **Phase 0 (2026-11-22):** `docs/assumptions.md`, research with a verification pass, and its UNVERIFIED list.
+- **Phase 1 (2026-11-22):** `docs/design.md`. The user accepted every recommended option, P1–P10, on 2026-11-22. Highlights: an
+  immutable escrow with a vault per swap; both Polygon clocks on every escrow, combined by leg; a gas drop from the maker in L→P;
+  the cap off-chain; liq2sol kept separate but sharing RFQ v3; the taker's wallet sends bridge legs.
+- **Phase 2 (building):** in the order of `docs/design.md` section 8, on test networks first (user's decision, 2026-11-22).
+
 ## Environment
 
 - The same machine and tools as liq2sol. Read liq2sol's `CLAUDE.md` "Environment notes":

@@ -1,11 +1,12 @@
 # liq2any: Phase 1 design
 
-Written 2026-11-22, for the user's review. **No code is written until the user accepts it.**
+Written 2026-11-22. **The user accepted every recommended option in section 9 on 2026-11-22.** The other options stay listed as a
+record of the trade-offs.
 
 Facts here are sourced in [assumptions.md](assumptions.md), cited by section (§). liq2sol is at `~/src/liq2sol`; its documents
 are cited as `liq2sol/docs/<file>`. Where this design repeats liq2sol, it says so and doesn't restate the reasoning.
 
-Section 9 lists the decisions for the user, each with options and a recommendation. Everything that depends on one of them says so.
+Section 9 lists the decisions, each with its options. Everything that depends on one of them says so.
 
 ## 1. What is being built
 
@@ -44,7 +45,7 @@ mainnet (section 6.5).
 One immutable contract, `Escrow`, per network (decision P3). It names a single token, set in the constructor: USDT0 on
 mainnet, the stand-in on Amoy. It has no owner, no upgrade, no pause and no fee.
 
-**Where the coins sit (decision P7).** Recommended: **each swap's coins sit at their own address**, a minimal vault contract
+**Where the coins sit (decision P7, accepted).** **Each swap's coins sit at their own address**, a minimal vault contract
 deployed by `Escrow` with CREATE2 for that swap. The vault's only function lets `Escrow` pay out of it.
 
 - Tether's blocklist stops a blocked address from sending (§1.2). If every swap's coins sat in `Escrow` itself, one block would
@@ -136,7 +137,7 @@ taker's own wallet. If the escrow sent one, a failed second hop would be refunde
 
 liq2sol's maker vault (its D6) lets a hot operator key lock up to a cap per window, while a cold owner key alone can withdraw. The
 same can be added here as a separate contract, `MakerVault`, which calls `Escrow.lock` with `initiator` set to the vault. It
-brings back one blockable address for the maker's float, which is the maker's own risk to take. Recommended for mainnet, not
+brings back one blockable address for the maker's float, which is the maker's own risk to take. Accepted (P9) for mainnet, not
 needed for the first testnet release.
 
 ### 2.7 Tests
@@ -508,13 +509,13 @@ Every "easy to get wrong" point in liq2sol's `CLAUDE.md` about Liquid still appl
 4. Page: the atomic swap on testnets; browser tests as liq2sol's.
 5. Mainnet: contract deployed by the user, then outbound bridge legs, then inbound.
 
-## 9. Decisions for the user
+## 9. Decisions (accepted 2026-11-22)
 
 ### P1. Which target chains first
 
 | Option | Trade-off |
 |---|---|
-| **Polygon only on testnets; then outbound to one-hop USDT0 chains (Arbitrum, Ethereum, Optimism, Plasma); then Solana and Tron via two hops; inbound last (recommended)** | Each step adds the least new code. One-hop legs are cents and a minute. Outbound needs no wallet on the destination. Solana is already atomic through liq2sol. |
+| **Polygon only on testnets; then outbound to one-hop USDT0 chains (Arbitrum, Ethereum, Optimism, Plasma); then Solana and Tron via two hops; inbound last (accepted)** | Each step adds the least new code. One-hop legs are cents and a minute. Outbound needs no wallet on the destination. Solana is already atomic through liq2sol. |
 | All outbound routes at once | Same code for all EVM chains, plus two-hop handling. More to test at once. |
 | Inbound early | Needed for P→L from other chains. Needs source-chain wallets (sol2tron's code for Solana and Tron), and 15–22 minutes of waiting. |
 
@@ -522,24 +523,24 @@ Every "easy to get wrong" point in liq2sol's `CLAUDE.md` about Liquid still appl
 
 | Option | Trade-off |
 |---|---|
-| **The maker's lock forwards a little POL to the taker (`gasTo`), sized for the claim, and optionally for the onward bridge fee; priced into the quote (recommended for L→P)** | No POL needed up front. A few lines in `lock`. The maker loses the drop if the taker never claims, so the drop is capped (`max_gas_drop`), and the taker has locked Liquid funds first, which limits griefing. |
+| **The maker's lock forwards a little POL to the taker (`gasTo`), sized for the claim, and optionally for the onward bridge fee; priced into the quote (accepted, for L→P)** | No POL needed up front. A few lines in `lock`. The maker loses the drop if the taker never claims, so the drop is capped (`max_gas_drop`), and the taker has locked Liquid funds first, which limits griefing. |
 | The taker must hold POL | No contract support. A Liquid user usually has none. |
 | Permissionless claim with a tip for whoever sends it | No POL needed. The taker must hand `s` to a relayer before the claim lands, and loses the swap if nobody sends it in time (liq2sol rejected the maker variant as D5). |
 | For P→L: a signed lock order sent by the maker | No POL needed to lock. Signature checks in the contract, and the maker chooses when to send it until the order expires. |
-| For P→L: nothing, since a taker with USDT0 on Polygon nearly always has POL, and one bridging in gets a native drop (§4) (**recommended for P→L**) | No contract support. The page adds the native-drop option to inbound bridge legs. |
+| For P→L: nothing, since a taker with USDT0 on Polygon nearly always has POL, and one bridging in gets a native drop (§4) (**accepted, for P→L**) | No contract support. The page adds the native-drop option to inbound bridge legs. |
 
 ### P3. An immutable contract
 
 | Option | Trade-off |
 |---|---|
-| **Immutable on mainnet; redeployed freely on testnets (recommended, as liq2sol's D8)** | Nobody needs to trust an upgrade key. A bug means a new address and a page release. |
+| **Immutable on mainnet; redeployed freely on testnets (accepted, as liq2sol's D8)** | Nobody needs to trust an upgrade key. A bug means a new address and a page release. |
 | Upgradeable behind a timelock or multisig | Bugs can be patched. Adds a trusted party, which the project avoids. |
 
 ### P4. The cap
 
 | Option | Trade-off |
 |---|---|
-| **The page's and the maker's cap, as liq2sol's 1000 USDT a swap, raised only by a release (recommended)** | Same rule as liq2sol. The contract stays general. |
+| **The page's and the maker's cap, as liq2sol's 1000 USDT a swap, raised only by a release (accepted)** | Same rule as liq2sol. The contract stays general. |
 | Also an on-chain maximum in the contract | A bug in the page or the maker can't exceed it. Raising it means a new immutable contract. |
 
 ### P5. Name and repository
@@ -548,14 +549,14 @@ Every "easy to get wrong" point in liq2sol's `CLAUDE.md` about Liquid still appl
 
 | Option | Trade-off |
 |---|---|
-| **Keep liq2any (recommended)** | Already in place. Says what it does. |
+| **Keep liq2any (accepted)** | Already in place. Says what it does. |
 | Rename (for example liq2poly) | More exact for the core, less for the routes. GitHub redirects renamed repositories. |
 
 ### P6. liq2sol: separate or merged
 
 | Option | Trade-off |
 |---|---|
-| **Separate repositories and daemons for now, with one shared RFQ v3 and a page that can use both (recommended)** | Nothing live changes. The page can prefer liq2sol's atomic Solana route and fall back to the bridge. liq2sol moves to v3 messages when convenient. |
+| **Separate repositories and daemons for now, with one shared RFQ v3 and a page that can use both (accepted)** | Nothing live changes. The page can prefer liq2sol's atomic Solana route and fall back to the bridge. liq2sol moves to v3 messages when convenient. |
 | Merge into one daemon and one page | One codebase and one place for makers. A large refactor of a live mainnet system. |
 | Fully separate, no shared RFQ | Least work. Two books, and Solana routes compete instead of complementing each other. |
 
@@ -563,14 +564,14 @@ Every "easy to get wrong" point in liq2sol's `CLAUDE.md` about Liquid still appl
 
 | Option | Trade-off |
 |---|---|
-| **A vault per swap (recommended)** | A Tether block hits one swap, or only new locks. About 45k more gas per lock (cents). A little more code. |
+| **A vault per swap (accepted)** | A Tether block hits one swap, or only new locks. About 45k more gas per lock (cents). A little more code. |
 | All in the escrow contract | Simplest and cheapest. One block freezes every open swap, and `destroyBlockedFunds` could burn them all. |
 
 ### P8. Deadlines
 
 | Option | Trade-off |
 |---|---|
-| **Both clocks on every escrow, combined by leg (2.4), with the durations of 3.4 (recommended)** | Closes the Polygon-halt theft without a restart signal, and keeps a long leg's margin through a halt or a block-time change. Longer taker waits when a maker never locks: about 8 h, against liq2sol's 5–6 h. |
+| **Both clocks on every escrow, combined by leg (2.4), with the durations of 3.4 (accepted)** | Closes the Polygon-halt theft without a restart signal, and keeps a long leg's margin through a halt or a block-time change. Longer taker waits when a maker never locks: about 8 h, against liq2sol's 5–6 h. |
 | Shorter durations (L→P short leg 1 h, P→L 6 h) | Faster refunds. Less than a span of margin against a censoring producer. |
 | Timestamps only | Simpler. The long leg loses its margin in a Polygon halt (§3.4). |
 
@@ -578,12 +579,12 @@ Every "easy to get wrong" point in liq2sol's `CLAUDE.md` about Liquid still appl
 
 | Option | Trade-off |
 |---|---|
-| **Port it for mainnet, not for the first testnet release (recommended, as liq2sol's D6)** | Caps what a stolen hot key can lock per window. One more contract and its tests. |
+| **Port it for mainnet, not for the first testnet release (accepted, as liq2sol's D6)** | Caps what a stolen hot key can lock per window. One more contract and its tests. |
 | Never | The hot key holds the whole float. |
 
 ### P10. Who sends the onward bridge leg
 
 | Option | Trade-off |
 |---|---|
-| **The taker's wallet, after the swap has paid it (recommended)** | Funds are never in a key the page holds, as the user decided for liq2sol's wallets on 2026-11-05. One more wallet prompt. |
+| **The taker's wallet, after the swap has paid it (accepted)** | Funds are never in a key the page holds, as the user decided for liq2sol's wallets on 2026-11-05. One more wallet prompt. |
 | A per-swap key the page holds, kept in the recovery file, which claims and bridges with no wallet prompt | Smoothest: the taker gives only a destination address. But the swap's coins sit in a browser key between claim and bridge, and a lost recovery file then loses them. |
