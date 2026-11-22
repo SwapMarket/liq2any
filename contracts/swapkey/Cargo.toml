@@ -1,0 +1,23 @@
+[package]
+name = "liq2any-swapkey"
+version = "0.1.0"
+edition = "2021"
+description = "liq2any confidential Liquid leg: a 2-of-2 taproot output claimed by adapter signature, refunded by a timelocked Simplicity leaf"
+license = "MIT"
+publish = false
+
+[features]
+# libsecp256k1, constant time, everywhere: the maker, signer, CLI and the page. The page's wasm32 build needs two settings,
+# in client/wasm/.cargo/config.toml. k256 is no longer offered: k256 0.13 brought crypto-bigint 0.5, which isn't constant time
+# (RUSTSEC-2026-0387).
+default = ["secp256k1"]
+secp256k1 = ["musig2/secp256k1"]
+
+[dependencies]
+simplicityhl = "=0.9.0"
+serde_json = "1"
+# Its adaptor code has no audit we could find. The backend is chosen below.
+musig2 = { version = "=0.4.1", default-features = false, features = ["rand"] }
+rand = "0.8"
+# Keccak-256, for the Polygon form of the lock point (docs/design.md section 2.2).
+sha3 = "=0.12.0"
