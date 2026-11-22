@@ -1,0 +1,153 @@
+//! The taker's side of a negotiation, over one relay. Each answer is checked before the next step, and nothing here
+//! ever touches funds: the caller derives the swap's address itself, and funds only after this returns.
+
+use std::time::{Duration, Instant};
+
+use nostr::prelude::*;
+
+use crate::messages::*;
+use crate::relay::{Relay, RelayEvent};
+use crate::rules::*;
+use crate::wrap::{self, Received};
+
+pub struct Negotiated {
+    /// Repeated on every later message of this swap.
+    pub id: String,
+    pub quote: Quote,
+    pub terms: MakerTerms,
+}
+
+/// What the taker commits to in its accept.
+pub struct TakerSide {
+    pub lock_point: [u8; 33],
+    pub taker_key: [u8; 33],
+    pub blinding_key: [u8; 32],
+    pub taker_polygon: String,
+    /// L→P, when the quote has a gas drop: where it goes.
+    pub gas_to: Option<String>,
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())
+}
+
+fn random_id() -> String {
+    hex(&Keys::generate().secret_key().to_secret_bytes())
+}
+
+/// Find live offers. Only a signature and the network are checked here: which makers to trust is the caller's choice.
+pub fn find_offers(relay: &mut Relay, network: &str, wait: Duration) -> Result<Vec<(PublicKey, Offer)>, String> {
+    relay.subscribe("liq2any-offers", &[Kind::from(OFFER_KIND)], None, now_secs().saturating_sub(3_600))?;
+    let start = Instant::now();
+    let mut offers: Vec<(PublicKey, Offer)> = vec![];
+    while start.elapsed() < wait {
+        match relay.next_event()? {
+            Some(RelayEvent::Event(e)) => {
+                if let Some(offer) = wrap::read_offer(&e, network, now_secs()) {
+                    offers.retain(|(pk, _)| *pk != e.pubkey);
+                    offers.push((e.pubkey, offer));
+                }
+            }
+            Some(RelayEvent::EndOfStored) if !offers.is_empty() => break,
+            _ => {}
+        }
+    }
+    Ok(offers)
+}
+
+/// Wait for a message of this negotiation from exactly this maker. Anything else is ignored, not an error, because
+/// anyone can send us anything.
+pub fn wait_from(
+    relay: &mut Relay,
+    me: &Keys,
+    maker: &PublicKey,
+    id: &str,
+    network: &str,
+    limit: Duration,
+) -> Result<Received, String> {
+    let start = Instant::now();
+    while start.elapsed() < limit {
+        if let Some(RelayEvent::Event(e)) = relay.next_event()? {
+            let Ok(got) = wrap::unwrap(me, &e) else { continue };
+            if got.sender != *maker
+                || got.envelope.id != id
+                || check_envelope(&got.envelope, network, now_secs()).is_err()
+            {
+                continue;
+            }
+            if let Body::RfqReject(r) = &got.envelope.body {
+                return Err(format!("the maker declined: {}", r.reason.chars().take(200).collect::<String>()));
+            }
+            return Ok(got);
+        }
+    }
+    Err("the maker did not answer in time".into())
+}
+
+/// Run one negotiation. `tip` reads the taker's own view of the Liquid tip, used to judge the terms.
+#[allow(clippy::too_many_arguments)]
+pub fn negotiate(
+    relay: &mut Relay,
+    me: &Keys,
+    maker: &PublicKey,
+    rules: &TakerRules,
+    request: Request,
+    side: TakerSide,
+    tip: impl Fn() -> Result<u32, String>,
+    limit: Duration,
+) -> Result<Negotiated, String> {
+    let id = random_id();
+    let pair = request.pair();
+    let envelope =
+        |body| Envelope { v: VERSION, id: id.clone(), network: rules.network.clone(), sent_at: now_secs(), body };
+    relay.subscribe(
+        &id[..16],
+        &[Kind::from(WRAP_KIND)],
+        Some(&me.public_key()),
+        now_secs().saturating_sub(2 * 86_400),
+    )?;
+
+    let (event, _) = wrap::wrap(me, maker, &envelope(Body::RfqRequest(request.clone())), now_secs())
+        .map_err(|e| format!("{e:?}"))?;
+    relay.publish(&event)?;
+
+    let got = wait_from(relay, me, maker, &id, &rules.network, limit)?;
+    let Body::RfqQuote(quote) = got.envelope.body else {
+        return Err("expected a quote".into());
+    };
+    check_quote(rules, &request, &quote, now_secs()).map_err(|e| format!("bad quote: {e:?}"))?;
+
+    let accept = Accept {
+        quote_event: got.rumor_id,
+        lock_point: hex(&side.lock_point),
+        taker_key: hex(&side.taker_key),
+        blinding_key: hex(&side.blinding_key),
+        taker_polygon: side.taker_polygon,
+        // A gas drop needs an address, and none is sent without one.
+        gas_to: if quote.gas_drop.0 > 0 { side.gas_to } else { None },
+    };
+    let (event, accept_id) =
+        wrap::wrap(me, maker, &envelope(Body::RfqAccept(accept)), now_secs()).map_err(|e| format!("{e:?}"))?;
+    relay.publish(&event)?;
+
+    let got = wait_from(relay, me, maker, &id, &rules.network, limit)?;
+    let Body::RfqTerms(terms) = got.envelope.body else {
+        return Err("expected terms".into());
+    };
+    check_terms(rules, pair, &quote, &accept_id, &terms, tip()?).map_err(|e| format!("bad terms: {e:?}"))?;
+    Ok(Negotiated { id, quote, terms })
+}
+
+/// Send one message of a swap already under way.
+pub fn send_body(
+    relay: &mut Relay,
+    me: &Keys,
+    maker: &PublicKey,
+    id: &str,
+    network: &str,
+    body: Body,
+) -> Result<(), String> {
+    let envelope = Envelope { v: VERSION, id: id.to_string(), network: network.to_string(), sent_at: now_secs(), body };
+    let (event, _) = wrap::wrap(me, maker, &envelope, now_secs()).map_err(|e| format!("{e:?}"))?;
+    relay.publish(&event)
+}

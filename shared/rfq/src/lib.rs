@@ -1,0 +1,23 @@
+//! RFQ over Nostr, version 3. Specification: docs/design.md section 5, on liq2sol's docs/nostr-rfq.md (docs/copied.md).
+//!
+//! No message here can move funds. A forged, replayed or withheld message can at worst waste time, because both sides
+//! derive every address themselves and check every lock on-chain.
+//!
+//! - [`messages`]: the wire format, parsed strictly.
+//! - [`rules`]: what each side must check, as pure functions.
+//! - [`wrap`]: NIP-59 sealing and gift wrapping.
+//! - [`relay`]: a small client for talking to relays.
+//! - [`taker`]: the taker's side of a negotiation.
+//! - [`mock_relay`]: a local relay for tests, which can also misbehave.
+
+#![forbid(unsafe_code)]
+
+pub mod messages;
+#[cfg(feature = "native")]
+pub mod mock_relay;
+#[cfg(feature = "native")]
+pub mod relay;
+pub mod rules;
+#[cfg(feature = "native")]
+pub mod taker;
+pub mod wrap;
