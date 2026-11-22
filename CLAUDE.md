@@ -22,7 +22,7 @@ liq2sol (`~/src/liq2sol`).
   when it makes sense, but **ask before each push**. The user approves a push by saying "push"; an "ok" or "yes" to something else
   is not enough.
 - End commit messages with `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`.
-- There is no GitHub repository yet. Creating `SwapMarket/liq2any` is the user's call: ask first.
+- Public repo: https://github.com/SwapMarket/liq2any (`origin`, branch `main`), created on 2026-11-22 (user's decision).
 - Show the user screenshots of visual changes before committing them.
 
 ## Environment
