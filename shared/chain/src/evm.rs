@@ -8,6 +8,9 @@ use sha3::{Digest, Keccak256};
 
 pub type Res<T> = Result<T, String>;
 
+/// The secret key type the signer holds for Polygon.
+pub use secp256k1::SecretKey as SecretKeyEvm;
+
 pub fn keccak256(data: &[u8]) -> [u8; 32] {
     Keccak256::digest(data).into()
 }
@@ -68,7 +71,7 @@ pub fn to_hex(bytes: &[u8]) -> String {
 
 pub fn from_hex(text: &str) -> Res<Vec<u8>> {
     let text = text.strip_prefix("0x").unwrap_or(text);
-    if text.len() % 2 != 0 || !text.is_ascii() {
+    if !text.len().is_multiple_of(2) || !text.is_ascii() {
         return Err(format!("{text:?} is not hex"));
     }
     (0..text.len())
@@ -239,6 +242,97 @@ impl Tx {
         rlp_list(&f, &mut out);
         Ok(out)
     }
+}
+
+// ---- Decoding our own transactions ----
+
+/// One RLP item: a byte string or a list of items.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Rlp<'a> {
+    Bytes(&'a [u8]),
+    List(Vec<Rlp<'a>>),
+}
+
+/// Decodes one item, which must use the shortest form, as our encoder does. Returns it and what follows.
+fn rlp_item(data: &[u8]) -> Res<(Rlp<'_>, &[u8])> {
+    let (&first, rest) = data.split_first().ok_or("RLP: nothing to read")?;
+    let take = |rest: &[u8], len: usize| -> Res<(usize, usize)> {
+        // A long form: `len` bytes of big-endian length, with no leading zero, for a length over 55.
+        let bytes = rest.get(..len).ok_or("RLP: truncated length")?;
+        if bytes.first() == Some(&0) {
+            return Err("RLP: a length with a leading zero".into());
+        }
+        let n = bytes.iter().try_fold(0usize, |n, &b| n.checked_mul(256).map(|n| n + usize::from(b))).ok_or("RLP: length overflow")?;
+        if n <= 55 {
+            return Err("RLP: a long form for a short length".into());
+        }
+        Ok((len, n))
+    };
+    let (header, len, list) = match first {
+        0x00..=0x7f => return Ok((Rlp::Bytes(&data[..1]), rest)),
+        0x80..=0xb7 => (0, usize::from(first - 0x80), false),
+        0xb8..=0xbf => {
+            let (h, n) = take(rest, usize::from(first - 0xb7))?;
+            (h, n, false)
+        }
+        0xc0..=0xf7 => (0, usize::from(first - 0xc0), true),
+        _ => {
+            let (h, n) = take(rest, usize::from(first - 0xf7))?;
+            (h, n, true)
+        }
+    };
+    let body = rest.get(header..header + len).ok_or("RLP: truncated item")?;
+    let after = &rest[header + len..];
+    if list {
+        let mut items = vec![];
+        let mut inner = body;
+        while !inner.is_empty() {
+            let (item, next) = rlp_item(inner)?;
+            items.push(item);
+            inner = next;
+        }
+        Ok((Rlp::List(items), after))
+    } else {
+        if len == 1 && body[0] < 0x80 {
+            return Err("RLP: a single small byte must stand alone".into());
+        }
+        Ok((Rlp::Bytes(body), after))
+    }
+}
+
+fn rlp_uint_of(item: &Rlp<'_>) -> Res<u128> {
+    let Rlp::Bytes(b) = item else { return Err("RLP: a number is a list".into()) };
+    if b.len() > 16 || b.first() == Some(&0) {
+        return Err("RLP: not a minimal number of at most 128 bits".into());
+    }
+    Ok(b.iter().fold(0u128, |n, &x| (n << 8) | u128::from(x)))
+}
+
+/// The fields of a signed EIP-1559 transaction of the shape `Tx::sign` makes: an empty access list and a signature.
+/// Anything else is refused. Used to sign our own transaction again at a new fee, never to read someone else's.
+pub fn decode_signed(raw: &[u8]) -> Res<Tx> {
+    let body = raw.strip_prefix(&[0x02]).ok_or("not an EIP-1559 transaction")?;
+    let (item, rest) = rlp_item(body)?;
+    if !rest.is_empty() {
+        return Err("bytes after the transaction".into());
+    }
+    let Rlp::List(f) = item else { return Err("a transaction is a list".into()) };
+    if f.len() != 12 || f[8] != Rlp::List(vec![]) {
+        return Err("not a transaction of our shape".into());
+    }
+    let small = |i: usize| -> Res<u64> { u64::try_from(rlp_uint_of(&f[i])?).map_err(|_| format!("field {i} is over 64 bits")) };
+    let Rlp::Bytes(to) = f[5] else { return Err("no destination".into()) };
+    let Rlp::Bytes(data) = f[7] else { return Err("no data".into()) };
+    Ok(Tx {
+        chain_id: small(0)?,
+        nonce: small(1)?,
+        max_priority_fee_per_gas: rlp_uint_of(&f[2])?,
+        max_fee_per_gas: rlp_uint_of(&f[3])?,
+        gas: small(4)?,
+        to: Address(to.try_into().map_err(|_| "a destination is 20 bytes")?),
+        value: rlp_uint_of(&f[6])?,
+        data: data.to_vec(),
+    })
 }
 
 /// The transaction hash of a raw signed transaction.

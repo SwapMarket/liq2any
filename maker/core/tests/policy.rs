@@ -6,7 +6,7 @@ use std::collections::HashMap;
 
 use liq2any_maker_core::engine::{blocks_for, Config, Direction};
 use liq2any_maker_core::policy::*;
-use liq2any_maker_core::store::SignerLedger;
+use liq2any_maker_core::store::{SignedCall, SignerLedger};
 use liq2any_maker_core::LockPoint;
 use liq2any_swapkey::point_of;
 
@@ -436,21 +436,23 @@ fn the_real_ledger_survives_a_restart_and_keeps_transactions_and_nonces() {
         let rec = check(&limits(), &ledger, NOW, &lock_liquid()).unwrap();
         ledger.commit(&hash(), &rec, Some((NOW, AMOUNT)), Some(b"tx"), &["cc:1".to_string()], None).unwrap();
         let rec = check(&limits(), &ledger, NOW, &Request::ClaimPolygon { lock_point: point(), secret: P }).unwrap();
-        ledger.commit(&hash(), &rec, None, None, &[], Some((0, &call, b"raw0"))).unwrap();
-        // A fee bump: the same call at the same nonce, with new bytes.
-        ledger.commit(&hash(), &rec, None, None, &[], Some((0, &call, b"raw0-bumped"))).unwrap();
+        let signed = |call: [u8; 32], raw: &[u8], fee| SignedCall { nonce: 0, call, raw: raw.to_vec(), max_fee: fee, priority_fee: 1 };
+        ledger.commit(&hash(), &rec, None, None, &[], Some(&signed(call, b"raw0", 100))).unwrap();
+        // A fee bump: the same call at the same nonce, with new bytes and fees.
+        ledger.commit(&hash(), &rec, None, None, &[], Some(&signed(call, b"raw0-bumped", 113))).unwrap();
         // Never another call at that nonce, even past the policy.
-        assert!(ledger.commit(&hash(), &rec, None, None, &[], Some((0, &other, b"evil"))).is_err());
+        assert!(ledger.commit(&hash(), &rec, None, None, &[], Some(&signed(other, b"evil", 999))).is_err());
     }
     let ledger = SignerLedger::open(&path).unwrap();
     assert_eq!(check(&limits(), &ledger, NOW, &refund(2_000)), Err(Refusal::RefundAfterClaim), "remembered across a restart");
     assert_eq!(check(&limits(), &ledger, NOW, &lock_liquid()), Err(Refusal::AlreadyLocked));
     assert_eq!(ledger.lock_tx(&hash()).unwrap().unwrap(), b"tx");
-    assert_eq!(ledger.nonce_call(0).unwrap(), Some((call, b"raw0-bumped".to_vec())));
+    let kept = ledger.nonce_call(0).unwrap().unwrap();
+    assert_eq!((kept.call, kept.raw.as_slice(), kept.max_fee), (call, &b"raw0-bumped"[..], 113));
     assert_eq!(ledger.nonce_of_call(&call).unwrap(), Some(0));
     assert_eq!(ledger.nonce_of_call(&other).unwrap(), None);
     assert_eq!(ledger.next_nonce().unwrap(), 1);
-    assert_eq!(ledger.signed_from(0).unwrap(), vec![(0, b"raw0-bumped".to_vec())]);
+    assert_eq!(ledger.signed_from(0).unwrap(), vec![kept]);
     assert!(ledger.signed_from(1).unwrap().is_empty());
     assert!(ledger.is_used("cc:1").unwrap() && !ledger.is_used("cc:2").unwrap(), "a signed payment's coins stay marked");
     assert!(ledger.reserve_fee_coin(&hash(), "aa:0").unwrap());

@@ -920,6 +920,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "liq2any-signer"
+version = "0.1.0"
+dependencies = [
+ "getrandom 0.2.17",
+ "liq2any-chain",
+ "liq2any-maker-core",
+ "liq2any-swapkey",
+ "serde",
+ "serde_json",
+ "sha2",
+ "simplicityhl",
+]
+
+[[package]]
 name = "liq2any-swapkey"
 version = "0.1.0"
 dependencies = [

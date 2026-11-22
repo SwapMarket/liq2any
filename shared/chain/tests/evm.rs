@@ -1,6 +1,6 @@
 //! `evm.rs` against Foundry's `cast`, byte for byte, from `tests/evm-vectors.txt` (made by `scripts/evm-vectors.sh`).
 
-use liq2any_chain::evm::{address_of, calldata, from_hex, to_hex, tx_hash, Address, Tx, Word};
+use liq2any_chain::evm::{address_of, calldata, decode_signed, from_hex, to_hex, tx_hash, Address, Tx, Word};
 use secp256k1::SecretKey;
 
 fn key(text: &str) -> SecretKey {
@@ -59,6 +59,7 @@ fn matches_cast() {
                 let raw = tx.sign(signing_key.as_ref().unwrap()).unwrap();
                 assert_eq!(format!("0x{}", to_hex(&raw)), f[9], "tx line {line}");
                 assert_eq!(tx_hash(&raw).len(), 32);
+                assert_eq!(decode_signed(&raw).unwrap(), tx, "decoding gives back what was signed");
                 txs += 1;
             }
             other => panic!("unknown kind {other}"),
@@ -90,4 +91,37 @@ fn returned_words_are_checked() {
     assert!(word_address(&data, 2).is_err(), "dirty top bytes");
     assert!(word_u128(&data, 2).is_err(), "over 128 bits");
     assert!(word_u128(&data, 3).is_err(), "past the end");
+}
+
+#[test]
+fn decoding_refuses_anything_but_our_shape() {
+    let key = SecretKey::from_slice(&[0x11; 32]).unwrap();
+    let tx = Tx {
+        chain_id: 137,
+        nonce: 3,
+        max_priority_fee_per_gas: 30_000_000_000,
+        max_fee_per_gas: 600_000_000_000,
+        gas: 250_000,
+        to: Address([0xaa; 20]),
+        value: 0,
+        data: vec![1, 2, 3],
+    };
+    let raw = tx.sign(&key).unwrap();
+    assert_eq!(decode_signed(&raw).unwrap(), tx);
+    assert!(decode_signed(&raw[1..]).is_err(), "no type byte");
+    assert!(decode_signed(&raw[..raw.len() - 1]).is_err(), "truncated");
+    let mut extra = raw.clone();
+    extra.push(0);
+    assert!(decode_signed(&extra).is_err(), "trailing bytes");
+    let mut legacy = raw.clone();
+    legacy[0] = 0x01;
+    assert!(decode_signed(&legacy).is_err(), "another type");
+    // Every single flipped byte either fails or decodes to something other than the original.
+    for i in 1..raw.len() {
+        let mut bad = raw.clone();
+        bad[i] ^= 0x80;
+        if let Ok(other) = decode_signed(&bad) {
+            assert!(other != tx || bad[i..].len() <= 66, "byte {i}");
+        }
+    }
 }

@@ -321,6 +321,13 @@ impl Rpc {
         from_hex(result.as_str().ok_or("eth_call returned no data")?)
     }
 
+    /// Runs a call from `from`, with `value`, against the latest block, and fails if it would revert. Nothing is sent.
+    pub fn simulate(&self, from: &Address, to: &Address, data: &[u8], value: u128) -> Res<()> {
+        let tx = json!({ "from": from.to_string(), "to": to.to_string(), "data": format!("0x{}", to_hex(data)),
+                         "value": format!("0x{value:x}") });
+        self.call("eth_call", json!([tx, "latest"])).map(|_| ())
+    }
+
     pub fn lock_at(&self, escrow: &Address, id: &[u8; 32], tag: &str) -> Res<Lock> {
         Lock::decode(&self.call_at(escrow, &calldata("locks(bytes32)", &[Word::Bytes32(*id)]), tag)?)
     }

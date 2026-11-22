@@ -369,6 +369,17 @@ impl Store {
     }
 }
 
+/// One signed Polygon transaction, as the ledger keeps it: its nonce, the hash of the call it carries (destination, value and
+/// data), its latest signed bytes and the fees they pay, which a replacement must outbid.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignedCall {
+    pub nonce: u64,
+    pub call: [u8; 32],
+    pub raw: Vec<u8>,
+    pub max_fee: u128,
+    pub priority_fee: u128,
+}
+
 /// The signer's ledger, in its own file. It answers `policy::Ledger` and persists each record before signing.
 pub struct SignerLedger {
     conn: Connection,
@@ -387,7 +398,10 @@ impl SignerLedger {
              CREATE TABLE IF NOT EXISTS pending_top_up (id INTEGER PRIMARY KEY CHECK (id = 1), raw_tx BLOB NOT NULL);
              CREATE TABLE IF NOT EXISTS pending_withdrawal (id INTEGER PRIMARY KEY CHECK (id = 1), raw_tx BLOB NOT NULL);
              CREATE TABLE IF NOT EXISTS addresses (idx INTEGER PRIMARY KEY, swap BLOB UNIQUE);
-             CREATE TABLE IF NOT EXISTS nonces (nonce INTEGER PRIMARY KEY, call BLOB NOT NULL, swap BLOB, raw_tx BLOB NOT NULL);",
+             CREATE TABLE IF NOT EXISTS nonces (
+                 nonce INTEGER PRIMARY KEY, call BLOB NOT NULL, swap BLOB, raw_tx BLOB NOT NULL,
+                 max_fee TEXT NOT NULL, priority_fee TEXT NOT NULL
+             );",
         )?;
         Ok(Self { conn })
     }
@@ -501,13 +515,17 @@ impl SignerLedger {
         Ok(())
     }
 
-    /// The call at a Polygon nonce, by the hash of its destination, value and data, and its latest signed bytes.
-    pub fn nonce_call(&self, nonce: u64) -> Result<Option<([u8; 32], Vec<u8>)>> {
-        let row: Option<(Vec<u8>, Vec<u8>)> = self
+    /// What is signed at a Polygon nonce.
+    pub fn nonce_call(&self, nonce: u64) -> Result<Option<SignedCall>> {
+        let row = self
             .conn
-            .query_row("SELECT call, raw_tx FROM nonces WHERE nonce = ?1", params![nonce as i64], |r| Ok((r.get(0)?, r.get(1)?)))
+            .query_row(
+                "SELECT nonce, call, raw_tx, max_fee, priority_fee FROM nonces WHERE nonce = ?1",
+                params![nonce as i64],
+                signed_call_row,
+            )
             .optional()?;
-        row.map(|(call, raw)| Ok((call.try_into().map_err(|_| StoreError("bad call hash in ledger".into()))?, raw))).transpose()
+        row.transpose()
     }
 
     /// The nonce a swap's call of this hash was given, if it was signed before.
@@ -526,10 +544,16 @@ impl SignerLedger {
     }
 
     /// Every signed transaction at or above `from`, lowest nonce first: what may still be pending.
-    pub fn signed_from(&self, from: u64) -> Result<Vec<(u64, Vec<u8>)>> {
-        let mut stmt = self.conn.prepare("SELECT nonce, raw_tx FROM nonces WHERE nonce >= ?1 ORDER BY nonce")?;
-        let rows = stmt.query_map(params![from as i64], |r| Ok((r.get::<_, i64>(0)? as u64, r.get(1)?)))?;
-        Ok(rows.map(|r| r.map_err(StoreError::from)).collect::<Result<Vec<_>>>()?)
+    pub fn signed_from(&self, from: u64) -> Result<Vec<SignedCall>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT nonce, call, raw_tx, max_fee, priority_fee FROM nonces WHERE nonce >= ?1 ORDER BY nonce")?;
+        let rows = stmt.query_map(params![from as i64], signed_call_row)?;
+        let mut out = vec![];
+        for row in rows {
+            out.push(row??);
+        }
+        Ok(out)
     }
 
     /// P→L swaps we have locked on Liquid and not yet settled, by claiming the taker's lock or refunding our coin. Each needs
@@ -576,26 +600,30 @@ impl SignerLedger {
         newly_locked: Option<(u64, u64)>,
         lock_tx: Option<&[u8]>,
         spends: &[String],
-        polygon: Option<(u64, &[u8; 32], &[u8])>,
+        polygon: Option<&SignedCall>,
     ) -> Result<()> {
         let tx = self.conn.unchecked_transaction()?;
         // A Polygon transaction: its nonce keeps one call forever, and the latest bytes signed for it (docs/design.md
         // section 4.2). The caller has checked `policy::nonce_rule`; the database refuses a second call at a nonce anyway.
-        if let Some((nonce, call, raw)) = polygon {
-            let existing: Option<Vec<u8>> = tx
-                .query_row("SELECT call FROM nonces WHERE nonce = ?1", params![nonce as i64], |r| r.get(0))
-                .optional()?;
+        if let Some(signed) = polygon {
+            let nonce = signed.nonce as i64;
+            let existing: Option<Vec<u8>> =
+                tx.query_row("SELECT call FROM nonces WHERE nonce = ?1", params![nonce], |r| r.get(0)).optional()?;
+            let (max_fee, priority) = (signed.max_fee.to_string(), signed.priority_fee.to_string());
             match existing {
-                Some(c) if c.as_slice() != call.as_slice() => {
+                Some(c) if c.as_slice() != signed.call.as_slice() => {
                     return Err(StoreError(format!("nonce {nonce} already carries another call")))
                 }
                 Some(_) => {
-                    tx.execute("UPDATE nonces SET raw_tx = ?1 WHERE nonce = ?2", params![raw, nonce as i64])?;
+                    tx.execute(
+                        "UPDATE nonces SET raw_tx = ?1, max_fee = ?2, priority_fee = ?3 WHERE nonce = ?4",
+                        params![signed.raw, max_fee, priority, nonce],
+                    )?;
                 }
                 None => {
                     tx.execute(
-                        "INSERT INTO nonces (nonce, call, swap, raw_tx) VALUES (?1, ?2, ?3, ?4)",
-                        params![nonce as i64, call.as_slice(), swap.as_slice(), raw],
+                        "INSERT INTO nonces (nonce, call, swap, raw_tx, max_fee, priority_fee) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                        params![nonce, signed.call.as_slice(), swap.as_slice(), signed.raw, max_fee, priority],
                     )?;
                 }
             }
@@ -641,6 +669,20 @@ impl Ledger for SignerLedger {
             .map(|sum| sum as u64)
             .unwrap_or(u64::MAX)
     }
+}
+
+fn signed_call_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Result<SignedCall>> {
+    let (nonce, call, raw, max_fee, priority): (i64, Vec<u8>, Vec<u8>, String, String) =
+        (r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?);
+    Ok((|| {
+        Ok(SignedCall {
+            nonce: nonce as u64,
+            call: call.try_into().map_err(|_| StoreError("bad call hash in ledger".into()))?,
+            raw,
+            max_fee: max_fee.parse().map_err(|_| StoreError("bad fee in ledger".into()))?,
+            priority_fee: priority.parse().map_err(|_| StoreError("bad fee in ledger".into()))?,
+        })
+    })())
 }
 
 fn fail_closed() -> SwapRecord {
