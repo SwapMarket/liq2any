@@ -271,8 +271,8 @@ pub fn check_terms(
         return Err(Refused::WrongReference);
     }
     if terms.chain_id != r.chain_id
-        || terms.escrow.to_ascii_lowercase() != r.escrow.to_ascii_lowercase()
-        || terms.token.to_ascii_lowercase() != r.token.to_ascii_lowercase()
+        || !terms.escrow.eq_ignore_ascii_case(&r.escrow)
+        || !terms.token.eq_ignore_ascii_case(&r.token)
     {
         return Err(Refused::WrongContract);
     }

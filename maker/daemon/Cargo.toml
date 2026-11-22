@@ -1,0 +1,18 @@
+[package]
+name = "liq2any-maker"
+version = "0.1.0"
+edition = "2021"
+description = "liq2any maker daemon: watches both chains and carries out the engine's decisions through the signer"
+license = "MIT"
+publish = false
+
+[dependencies]
+liq2any-chain = { path = "../../shared/chain" }
+liq2any-swapkey = { path = "../../contracts/swapkey" }
+liq2any-maker-core = { path = "../core" }
+liq2any-rfq = { path = "../../shared/rfq" }
+liq2any-signer = { path = "../signer" }
+nostr = { version = "=0.45.7", features = ["std", "os-rng", "nip44"] }
+simplicityhl = "=0.9.0"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

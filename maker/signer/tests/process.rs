@@ -1063,7 +1063,7 @@ fn withdrawals(world: &World, config: &Config, root: &Path, private: &Path) {
     let _signer = SignerProcess::start(&path, &socket);
     let mut client = Client::connect(&socket).unwrap();
     let held = world.evm.token_balance(&world.maker_polygon);
-    let some = client.call(&Call::Withdraw { chain: Chain::Polygon, asset: Asset::Usdt, amount: Some(USDT0) }).unwrap();
+    let some = client.call(&Call::Withdraw { chain: Chain::Polygon, asset: Asset::Usdt, amount: Some(u128::from(USDT0)) }).unwrap();
     world.evm.publish(&some);
     assert_eq!(world.evm.token_balance(cold), u128::from(USDT0));
     // A caller naming its own destination: the field isn't part of the request, so it changes nothing.

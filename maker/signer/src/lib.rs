@@ -247,8 +247,9 @@ pub enum Call {
     RefundLiquid { terms: SwapTerms },
     RefundPolygon { lock_point: LockPoint },
     /// The operator's withdrawal, in the chain's base units, or all of it. It always goes to `withdraw_to` in the config: this
-    /// carries no destination, so a compromised caller can at worst move funds to the operator's own address.
-    Withdraw { chain: Chain, asset: Asset, amount: Option<u64> },
+    /// carries no destination, so a compromised caller can at worst move funds to the operator's own address. 128 bits, since
+    /// 64 bits of wei is only 18.4 POL.
+    Withdraw { chain: Chain, asset: Asset, amount: Option<u128> },
     Extend { taker_polygon: String, lock_point: LockPoint, new_time: u64, new_block: u64 },
     Release { taker_polygon: String, lock_point: LockPoint },
     /// Every Polygon transaction signed and not yet mined, lowest nonce first, re-signed at a higher fee where the network's has
@@ -660,7 +661,8 @@ impl Signer {
 
     /// To the operator's own address, from `withdraw_to`. One at a time, and a retry gets the same bytes, like a top-up. It
     /// spends only coins nothing else has a claim on: fee coins promised to a swap stay, and so do coins a payment has used.
-    fn withdraw_liquid(&self, asset: Asset, amount: Option<u64>) -> Outcome {
+    fn withdraw_liquid(&self, asset: Asset, amount: Option<u128>) -> Outcome {
+        let amount = amount.map(u64::try_from).transpose().map_err(|_| "a Liquid amount is at most 64 bits")?;
         let to = self.withdraw_liquid.clone().ok_or("no Liquid withdrawal address is set in withdraw_to")?;
         if let Some(raw) = self.ledger.pending_withdrawal().map_err(|e| e.to_string())? {
             let tx: LiquidTx = deserialize(&raw).map_err(|e| e.to_string())?;
@@ -709,7 +711,7 @@ impl Signer {
     /// To the operator's own address, from `withdraw_to`. A P→L swap we have locked on Liquid is only ours to finish by claiming
     /// the taker's lock, which costs POL. Without it the deadline passes, the taker refunds, and keeps our Liquid coin too. So POL
     /// for each stays, whatever is asked.
-    fn withdraw_polygon(&self, asset: Asset, amount: Option<u64>) -> Outcome {
+    fn withdraw_polygon(&self, asset: Asset, amount: Option<u128>) -> Outcome {
         let to = self.withdraw_polygon.ok_or("no Polygon withdrawal address is set in withdraw_to")?;
         let none = [0u8; 32];
         match (asset, amount) {
@@ -717,12 +719,12 @@ impl Signer {
             (Asset::Usdt, amount) => {
                 let amount = match amount {
                     Some(a) => a,
-                    None => self.polygon_usdt()?,
+                    None => u128::from(self.polygon_usdt()?),
                 };
                 if amount == 0 {
                     return Err("there is no USDT0 to withdraw".to_string().into());
                 }
-                let data = calldata("transfer(address,uint256)", &[Word::Address(to), Word::Uint(u128::from(amount))]);
+                let data = calldata("transfer(address,uint256)", &[Word::Address(to), Word::Uint(amount)]);
                 let signed = self.sign_polygon(self.ids.token, 0, data, TOKEN_TRANSFER_GAS, true)?;
                 self.commit_polygon(&none, &signed)?;
                 Ok(polygon_reply(&signed))
@@ -733,7 +735,7 @@ impl Signer {
                 let (max_fee, _) = self.polygon_fees()?;
                 let gas_cost = u128::from(POL_TRANSFER_GAS).saturating_mul(max_fee);
                 let amount = match amount {
-                    Some(a) => u128::from(a),
+                    Some(a) => a,
                     // All but the gas for this transfer and the claims still to make.
                     None => held.saturating_sub(gas_cost).saturating_sub(pol_kept(unsettled)),
                 };

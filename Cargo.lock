@@ -1099,6 +1099,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "liq2any-maker"
+version = "0.1.0"
+dependencies = [
+ "liq2any-chain",
+ "liq2any-maker-core",
+ "liq2any-rfq",
+ "liq2any-signer",
+ "liq2any-swapkey",
+ "nostr",
+ "serde",
+ "serde_json",
+ "simplicityhl",
+]
+
+[[package]]
 name = "liq2any-maker-core"
 version = "0.1.0"
 dependencies = [

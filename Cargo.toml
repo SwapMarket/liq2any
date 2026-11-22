@@ -1,3 +1,3 @@
 [workspace]
 resolver = "2"
-members = ["contracts/swapkey", "shared/chain", "maker/core", "maker/signer", "shared/rfq"]
+members = ["contracts/swapkey", "shared/chain", "maker/core", "maker/signer", "shared/rfq", "maker/daemon"]
