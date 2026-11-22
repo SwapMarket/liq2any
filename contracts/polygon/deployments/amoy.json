@@ -1,0 +1,13 @@
+{
+  "network": "amoy",
+  "chain_id": 80002,
+  "token": "0xb4236fbd3bc5791Ee0faB7f065f96F591d33a724",
+  "token_tx": "(deployed earlier)",
+  "escrow": "0xD1C669097D4EDb41B5A5b3541aFB5c22b7Bd6f6F",
+  "escrow_tx": "0xe6111ce0e1c73ada6e0f5ea805cebf4e47c0cef0e925ed9eefa7ef9c27210a63",
+  "escrow_block": 53556928,
+  "max_window_blocks": 1209600,
+  "max_extension_blocks": 604800,
+  "deployer": "0xf302cef33d34548De16E28561054267E2B6Db5bA",
+  "source_commit": "ad2158dd102d5997519ecbc92858d354c72188b8"
+}

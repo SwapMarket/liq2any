@@ -49,4 +49,20 @@ The constructor takes the token and the block counterparts of 14 days and 7 days
 - Polygon mainnet, 1.5 s blocks: `806400 403200`;
 - Amoy, 1.0 s blocks: `1209600 604800`.
 
-The user deploys. Mainnet is deployed once and never changed (decision P3).
+The user deploys mainnet, once, and it never changes (decision P3).
+
+## Amoy
+
+Deployed 2026-11-22 by `scripts/deploy-amoy.sh`, with the record in `deployments/amoy.json`:
+
+- stand-in token `tUSDT0`: `0xb4236fbd3bc5791Ee0faB7f065f96F591d33a724`;
+- escrow: `0xD1C669097D4EDb41B5A5b3541aFB5c22b7Bd6f6F`.
+
+The script checked that both contracts' code matches this build, apart from immutables. A smoke test on Amoy the same day:
+
+- a maker-style lock with a 0.001 POL gas drop, tx `0x6f223212…9155`, 273,387 gas;
+- a claim with the wrong secret, refused with `WrongSecret`;
+- the claim, tx `0xd9aee60a…c09e`, 128,230 gas, which paid the recipient 25 tUSDT0;
+- the gas drop arrived, and the escrow shows `Claimed` with the secret stored.
+
+The deployer key is test-network only, in `.keys/` (ignored by git).
