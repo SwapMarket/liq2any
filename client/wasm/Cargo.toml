@@ -1,0 +1,37 @@
+# What the browser runs. Blinding, signing and Nostr are the same Rust the maker and CLI use, so there is no second
+# implementation to get wrong. Polygon calls are built here too, from the same shared code the maker signs with.
+[package]
+name = "liq2any-client-wasm"
+version = "0.1.0"
+edition = "2021"
+description = "liq2any taker client: the protocol logic, compiled to WebAssembly"
+license = "AGPL-3.0-only"
+publish = false
+
+[workspace]
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+liq2any-chain = { path = "../../shared/chain", default-features = false }
+liq2any-rfq = { path = "../../shared/rfq", default-features = false }
+liq2any-swapkey = { path = "../../contracts/swapkey" }
+simplicityhl = "=0.9.0"
+wasm-bindgen = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+nostr = { version = "=0.45.7", features = ["std", "os-rng", "nip44"] }
+# Browsers get randomness from crypto.getRandomValues, through this feature.
+getrandom = { version = "0.2", features = ["js"] }
+# The Nostr library needs a newer version too, and it has its own switch.
+getrandom04 = { package = "getrandom", version = "0.4", features = ["wasm_js"] }
+# And musig2's rand, which also needs the cfg in .cargo/config.toml.
+getrandom03 = { package = "getrandom", version = "0.3", features = ["wasm_js"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+universal-time = "0.3"
+js-sys = "0.3"
+
+[dev-dependencies]
+liq2any-chain = { path = "../../shared/chain" }

@@ -1,0 +1,77 @@
+# Reproducible page build
+
+**Copied from liq2sol, and not yet in use here.** The scripts and workflows below (`scripts/build-page.sh`, `check-page.sh`,
+`publish-nsite.sh`, `.github/workflows/`) haven't been ported to liq2any. They come with its first release. Until then, the page runs
+on test networks only, served from the repository (`client/build.sh`, then any static server on `client/site`).
+
+The published page at https://swapmarket.github.io/liq2any/ is built here, in a container pinned to exact tools, so anyone can rebuild
+it from the commit it names and get the same bytes.
+
+- `Dockerfile`: Rust 1.99.1 by image digest, `clang`, `llvm` and Node from one Debian snapshot date, `wasm-bindgen-cli` at the version in
+  `client/wasm/Cargo.lock`, and binaryen 117's `wasm-opt`, checked by hash. Always built as `linux/amd64`.
+- `build-inside.sh`: builds one commit's `git archive` at fixed paths, runs `client/stamp.mjs`, and writes `SHA256SUMS`.
+
+## Check the live page
+
+With Docker and this repository:
+
+```sh
+scripts/check-page.sh
+```
+
+It reads the commit from the page's footer, rebuilds it with `scripts/build-page.sh`, and compares every file the site serves with the
+rebuild. The first run builds the toolchain image, which takes about 20 minutes. Later runs take about 5.
+
+`.github/workflows/check-live.yml` runs it every day against GitHub Pages and the nsite, and warns when the nsite names an
+older commit than GitHub Pages.
+
+## Build one commit
+
+```sh
+scripts/build-page.sh <commit> <out folder>
+```
+
+The deploy (`.github/workflows/pages.yml`) runs this twice, on two machines, and publishes only if both agree byte for byte.
+
+## The nsite on Nostr
+
+The page is also an nsite (NIP-5A, a draft): its files sit on Blossom servers, and a signed kind 35128 event, the manifest, maps
+each path to its sha256. It is SwapMarket's named site `liq2any`, under
+`npub1xhklzztd83v34zsf9da2gvfrctj5wcsvsx09er9v26jy7r0uq8yq4vme7d` (hex `35edf109…f0dfc01c8`), at
+
+  https://1cdzwdkc0uepk5ll8mhpcbyw3xh8gakldbfdq8fphhqnv503bcliq2any.nwb.tf/
+
+- **Whose it is.** The address's first 50 characters are the public key in base36, then the site name:
+  `'%064x' % int('1cdzwdkc0uepk5ll8mhpcbyw3xh8gakldbfdq8fphhqnv503bc', 36)` is the hex key above. A gateway serves that key's manifest,
+  so the address alone says whose site it is, not that the gateway serves it faithfully.
+- **Check it** like the main site: `scripts/check-page.sh <nsite address>`. The nsite has no `SHA256SUMS`, since NIP-5A paths need an
+  extension. The manifest's `path` tags carry the same hashes.
+- **Gateways** (checked 2026-11-19): the footers link to nwb.tf (`NSITE_GATEWAY` in `client/site/js/sites.js`), which showed each new
+  manifest within minutes. nsite.lol served liq2sol's first manifest and never a later one, though its own relay held the newest; it
+  picked up the other sites, which it hadn't served before, at once (UNVERIFIED why). nsite.cloud tells browsers to cache it for a
+  year, so returning visitors may not get a fix. nsite.run adds its own Content-Security-Policy, which blocks the WebAssembly, so the
+  page can't start there. Each gateway is its own origin: swaps saved on one don't show on another, though recovery files work on all.
+- **WalletConnect** works only on origins in the Reown project's allowlist: `swapmarket.github.io` and each site's nwb.tf address.
+- **Blossom servers:** blossom.yakihonne.com and nostr.download hold every file. nostr.download labels HTML and JavaScript
+  `text/plain`, so it is listed second. Many servers refuse HTML, JavaScript or WebAssembly.
+- **Publishing** is by hand, after a release, like signing it: `scripts/publish-nsite.sh liq2any [commit]` builds the commit and serves
+  `scripts/nsite/publish.html` on `http://127.0.0.1:8765`, which signs through a NIP-07 extension (Alby) holding SwapMarket's key.
+  The key never reaches the repository, the script or CI, and the page refuses any other key. Gateways read the manifest from the
+  key's own relays (kind 10002), which the page publishes to as well.
+  It also publishes to `relay.nsite.lol`, where nsite.lol looks. An event copied there later, with its old timestamp, was not picked
+  up (2026-11-19, UNVERIFIED why): to update a gateway, sign a new manifest.
+  It then signs a snapshot (kind 5128), which keeps each version's paths and hashes addressable after the next manifest replaces it.
+- **SwapMarket's other sites** are nsites under the same key: sol2base, eth2base and sol2tron as named sites, and BTC Swaps
+  (SwapMarket/swapmarket.github.io) as the root site, at `<npub>.<gateway>`. `scripts/publish-nsite.sh sol2base|eth2base|sol2tron|btc` takes
+  the site's latest GitHub Pages build from its deploy's artifact, refuses it unless every file is what GitHub Pages serves now, and
+  publishes those bytes. BTC Swaps' docs stay on GitHub Pages. Each site's menu links to the others on the same gateway when it is
+  opened on one under SwapMarket's key, and to GitHub Pages anywhere else (`client/site/js/sites.js`).
+- **Frames.** Neither GitHub Pages nor the gateways forbid framing, and a meta CSP can't. So the page refuses to run inside another
+  page, where an overlay could steer clicks, and offers a link to open it in its own tab.
+
+## Limits
+
+- It trusts the pinned image, the Debian snapshot and crates.io's checksums in `Cargo.lock`, as any build does.
+- Browser tests build the WebAssembly with `wasm-pack` instead, so they test the same source, not the same bytes.
+- `index.html` pins every other file by hash (`client/stamp.mjs`), so checking it alone covers the page in browsers with import-map
+  integrity.

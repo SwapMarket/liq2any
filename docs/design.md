@@ -480,7 +480,8 @@ nothing else.
 - **EVM:** injected wallets through EIP-6963, else WalletConnect.
   - The `eip155` namespace (`eip155:137`, `eip155:80002`) goes into liq2sol's existing `SignClient`, one client per page.
   - Methods: `eth_sendTransaction` and `eth_signTypedData_v4` (for `lockWithPermit`).
-  - viem for encoding and reads, as eth2base and sol2tron use.
+  - Encoding and decoding in the WASM, from the same shared Rust the maker uses, with tests comparing the page's transactions with
+    the maker's, as liq2sol does for Solana. No viem (user's decision, 2026-11-23).
 - **Reads:** two independent endpoints for every decision. publicnode and drpc both send open CORS headers, on mainnet and on Amoy
   (checked 2026-11-22). Heimdall's milestone API also sends them, so the page can see a stall itself.
 - **Before revealing `s`:** the escrow at `finalized` on both endpoints, `isBlocked(recipient)` false, and an `eth_call`

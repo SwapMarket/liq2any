@@ -1,0 +1,833 @@
+//! The taker client's protocol logic. JavaScript handles the page, the network and the wallet, and every decision that
+//! touches funds or secrets is made here, in the Rust the maker and CLI already test.
+//!
+//! Arguments and results are JSON, with amounts as strings. A signing nonce never leaves this module.
+
+// `deny` and not `forbid`, only because the clock's macro below exports a symbol, which counts as unsafe.
+#![deny(unsafe_code)]
+
+/// The browser's clock, which the Nostr library asks for by a linker symbol on this target.
+#[cfg(target_arch = "wasm32")]
+#[allow(unsafe_code)]
+mod clock {
+    use std::time::Duration;
+
+    use universal_time::{define_time_provider, Instant, MonotonicClock, SystemTime, WallClock};
+
+    struct Browser;
+
+    fn now() -> Duration {
+        Duration::from_millis(js_sys::Date::now() as u64)
+    }
+
+    impl WallClock for Browser {
+        fn system_time(&self) -> SystemTime {
+            SystemTime::from_unix_duration(now())
+        }
+    }
+
+    impl MonotonicClock for Browser {
+        fn instant(&self) -> Instant {
+            Instant::from_ticks(now())
+        }
+    }
+
+    define_time_provider!(Browser);
+}
+
+use std::str::FromStr;
+
+use liq2any_chain::evm::{from_hex, to_hex, Address as EvmAddress};
+use liq2any_chain::liquid::{
+    build_swap_spend, keypair_from, lbtc, random32, read_output, sign_keypath, usdt, use_network, Coin, NetworkConfig,
+    SecretCoin, LIQUID_MAINNET_GENESIS, MAINNET_USDT,
+};
+use liq2any_chain::polygon::{approve_call, claim_call, lock_call, lock_id as id_of, refund_call, Lock, State as LockState};
+use liq2any_chain::swap::{answer_claim_with, EarlyRefund, swap_address, swap_output, taker_fee_address, SignedClaim, TakerClaim};
+use liq2any_rfq::messages::{self as msg, Body, Envelope, MakerTerms, Offer, Pair, Quote, Request};
+use liq2any_rfq::rules::{check_envelope, check_quote, check_terms, TakerRules};
+use liq2any_rfq::wrap;
+use liq2any_swapkey::{
+    aggregate_bytes, aggregate_from, nonce_bytes, nonce_from, point_of, polygon_address_of, polygon_value, share_bytes,
+    share_from, SwapOutput,
+};
+use nostr::prelude::{Event, Keys, PublicKey as NostrKey, SecretKey as NostrSecret};
+use serde::Deserialize;
+use serde_json::{json, Value};
+use simplicityhl::elements::encode::{deserialize, serialize_hex};
+use simplicityhl::elements::secp256k1_zkp::{Keypair, Message, Secp256k1, SecretKey};
+use simplicityhl::elements::{Address, AddressParams, AssetId, BlockHash, OutPoint, Sequence, Transaction, TxOut};
+use wasm_bindgen::prelude::wasm_bindgen;
+
+type Res<T> = Result<T, String>;
+
+fn hex(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+fn unhex(s: &str) -> Res<Vec<u8>> {
+    if !s.len().is_multiple_of(2) || !s.is_ascii() {
+        return Err("bad hex".into());
+    }
+    (0..s.len() / 2).map(|i| u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).map_err(|e| e.to_string())).collect()
+}
+
+fn arr<const N: usize>(s: &str) -> Res<[u8; N]> {
+    unhex(s)?.try_into().map_err(|_| format!("expected {N} bytes"))
+}
+
+fn parse<T: for<'a> Deserialize<'a>>(text: &str) -> Res<T> {
+    serde_json::from_str(text).map_err(|e| format!("bad arguments: {e}"))
+}
+
+fn tx(text: &str) -> Res<Transaction> {
+    deserialize(&unhex(text)?).map_err(|e| format!("bad transaction: {e}"))
+}
+
+fn secret(text: &str) -> Res<SecretKey> {
+    SecretKey::from_slice(&arr::<32>(text)?).map_err(|e| e.to_string())
+}
+
+fn genesis(text: &str) -> Res<BlockHash> {
+    // The page's configuration can be edited, so this is checked here too: mainnet's genesis goes with mainnet's assets and
+    // addresses, and with nothing else.
+    let on_mainnet = usdt().to_string() == MAINNET_USDT;
+    if (text == LIQUID_MAINNET_GENESIS) != on_mainnet {
+        return Err("refusing to run: the genesis and the chosen network don't match".into());
+    }
+    BlockHash::from_str(text).map_err(|e| e.to_string())
+}
+
+/// Select Liquid mainnet: its addresses, Tether's USDt and L-BTC. Called once at startup, before anything else.
+#[wasm_bindgen]
+pub fn use_mainnet() -> Result<(), String> {
+    use_network(NetworkConfig::mainnet());
+    if usdt().to_string() != MAINNET_USDT {
+        return Err("another network was already chosen".into());
+    }
+    Ok(())
+}
+
+/// Testnet is the built-in default. This selects regtest's assets, and is only used by tests.
+#[wasm_bindgen]
+pub fn use_regtest(usdt_id: &str, lbtc_id: &str) -> Result<(), String> {
+    use_network(NetworkConfig {
+        params: &AddressParams::ELEMENTS,
+        usdt: AssetId::from_str(usdt_id).map_err(|e| e.to_string())?,
+        lbtc: AssetId::from_str(lbtc_id).map_err(|e| e.to_string())?,
+    });
+    Ok(())
+}
+
+// ---- Swap keys ----
+
+/// Fresh secrets for one swap, and what may be told to the maker about them.
+#[wasm_bindgen]
+pub fn new_swap_secrets() -> Result<String, String> {
+    let lock_secret = random32()?;
+    let taker_sk = random32()?;
+    let blinding_key = random32()?;
+    secret(&hex(&lock_secret))?;
+    secret(&hex(&blinding_key))?;
+    let key = keypair_from(&taker_sk)?;
+    let point = point_of(&lock_secret).map_err(|e| e.to_string())?;
+    Ok(json!({
+        "lock_secret": hex(&lock_secret),
+        "taker_sk": hex(&taker_sk),
+        "blinding_key": hex(&blinding_key),
+        "lock_point": hex(&point),
+        "lock_address": EvmAddress(polygon_address_of(&point).map_err(|e| e.to_string())?).checksummed(),
+        "taker_key": hex(&key.public_key().serialize()),
+    })
+    .to_string())
+}
+
+/// What a claim reveals on Polygon for this secret.
+#[wasm_bindgen]
+pub fn revealed_value(lock_secret: &str) -> Result<String, String> {
+    Ok(hex(&polygon_value(&arr(lock_secret)?).map_err(|e| e.to_string())?))
+}
+
+/// The point as the Polygon escrow locks to it: its address, from the point's compressed form.
+#[wasm_bindgen]
+pub fn lock_address(lock_point: &str) -> Result<String, String> {
+    Ok(EvmAddress(polygon_address_of(&arr(lock_point)?).map_err(|e| e.to_string())?).checksummed())
+}
+
+#[derive(Deserialize)]
+struct SwapArgs {
+    direction: String,
+    maker_key: String,
+    taker_key: String,
+    blinding_key: String,
+    lock_height: u32,
+}
+
+impl SwapArgs {
+    fn output(&self) -> Res<SwapOutput> {
+        let taker_funds = match self.direction.as_str() {
+            "L2P" => true,
+            "P2L" => false,
+            _ => return Err("an unknown direction".into()),
+        };
+        swap_output(&arr(&self.maker_key)?, &arr(&self.taker_key)?, taker_funds, self.lock_height)
+    }
+}
+
+/// A Liquid address someone gave us to be paid at: for this network, and confidential. An address for another network has the
+/// same script, so a payment to it would land, but only that other network's wallet could spend it.
+fn payout_address(address: &str) -> Res<Address> {
+    let a = Address::from_str(address.trim()).map_err(|_| "This isn't a Liquid address.".to_string())?;
+    if *a.params != *liq2any_chain::liquid::network().params {
+        return Err("This address is for another network.".into());
+    }
+    if !a.is_blinded() {
+        return Err("Use a confidential address, so the amount stays hidden.".into());
+    }
+    Ok(a)
+}
+
+/// What is wrong with an address to be paid at, or nothing.
+#[wasm_bindgen]
+pub fn address_problem(address: &str) -> String {
+    payout_address(address).err().unwrap_or_default()
+}
+
+/// An address's plain form, without its blinding key, which is what an explorer's address page shows.
+#[wasm_bindgen]
+pub fn plain_address(address: &str) -> Result<String, String> {
+    let a = Address::from_str(address).map_err(|e| format!("bad Liquid address: {e}"))?;
+    Ok(a.to_unconfidential().to_string())
+}
+
+/// The addresses of a swap, derived here and never taken from the maker.
+#[wasm_bindgen]
+pub fn swap_info(args: &str) -> Result<String, String> {
+    let a: SwapArgs = parse(args)?;
+    let output = a.output()?;
+    let blinding = secret(&a.blinding_key)?;
+    let address = swap_address(&output, &blinding);
+    let fee = taker_fee_address(&arr(&a.taker_key)?, &blinding)?;
+    Ok(json!({
+        "address": address.to_string(),
+        "plain_address": address.to_unconfidential().to_string(),
+        "script": hex(address.script_pubkey().as_bytes()),
+        "fee_address": fee.to_string(),
+        "plain_fee_address": fee.to_unconfidential().to_string(),
+        "fee_script": hex(fee.script_pubkey().as_bytes()),
+        "cmr": hex(&output.cmr()),
+    })
+    .to_string())
+}
+
+// ---- Reading coins ----
+
+/// Each output of this transaction paying this script, as read with this key. Nothing on-chain checks the asset or amount,
+/// so `usdt` and `amount` here are what the client relies on. A label in a range proof that doesn't open the asset
+/// commitment isn't read at all.
+#[wasm_bindgen]
+pub fn read_coins(tx_hex: &str, script: &str, blinding_key: &str) -> Result<String, String> {
+    let t = tx(tx_hex)?;
+    let spk = unhex(script)?;
+    let key = secret(blinding_key)?;
+    let found: Vec<Value> = t
+        .output
+        .iter()
+        .enumerate()
+        .filter(|(_, o)| o.script_pubkey.as_bytes() == spk.as_slice())
+        .filter_map(|(vout, o)| {
+            read_output(o, &key).map(|s| {
+                json!({
+                    "vout": vout,
+                    "amount": s.value.to_string(),
+                    "is_usdt": s.asset == usdt(),
+                    "is_lbtc": s.asset == lbtc(),
+                    "asset": s.asset.to_string(),
+                    "hidden": !o.asset.is_explicit() && !o.value.is_explicit(),
+                })
+            })
+        })
+        .collect();
+    Ok(Value::Array(found).to_string())
+}
+
+/// What a block explorer needs to show one output in the clear: value, asset, value blinder and asset blinder, as Esplora's
+/// `#blinded=` link takes them (client/src/driver/blinding.js). Anyone with the link can read this output.
+#[wasm_bindgen]
+pub fn explorer_blinders(tx_hex: &str, vout: u32, blinding_key: &str) -> Result<String, String> {
+    let t = tx(tx_hex)?;
+    let out = t.output.get(vout as usize).ok_or("no such output")?;
+    let s = read_output(out, &secret(blinding_key)?).ok_or("can't read this output")?;
+    Ok(format!("{},{},{},{}", s.value, s.asset, s.value_bf, s.asset_bf))
+}
+
+/// Which parent transactions a transaction spends, in input order.
+#[wasm_bindgen]
+pub fn parents_of(tx_hex: &str) -> Result<String, String> {
+    let t = tx(tx_hex)?;
+    let list: Vec<String> = t.input.iter().map(|i| i.previous_output.txid.to_string()).collect();
+    Ok(json!(list).to_string())
+}
+
+/// The outputs spent by a transaction, from its parents in input order. The parents' ids are checked, so a lying API can't
+/// change what gets signed.
+fn spent_from(t: &Transaction, parents: &[String]) -> Res<Vec<TxOut>> {
+    if parents.len() != t.input.len() {
+        return Err("one parent transaction is needed per input".into());
+    }
+    t.input
+        .iter()
+        .zip(parents)
+        .map(|(i, p)| {
+            let parent = tx(p)?;
+            if parent.txid() != i.previous_output.txid {
+                return Err("a parent transaction doesn't match its input".to_string());
+            }
+            parent
+                .output
+                .get(i.previous_output.vout as usize)
+                .cloned()
+                .ok_or("an input's output is missing".to_string())
+        })
+        .collect()
+}
+
+fn secret_coin(tx_hex: &str, vout: u32, key: &SecretKey) -> Res<SecretCoin> {
+    let t = tx(tx_hex)?;
+    let out = t.output.get(vout as usize).ok_or("no such output")?.clone();
+    let secrets = read_output(&out, key).ok_or("this output can't be read")?;
+    Ok(SecretCoin { coin: Coin { outpoint: OutPoint::new(t.txid(), vout), out, height: None }, secrets })
+}
+
+// ---- L to P: signing the maker's claim ----
+
+#[derive(Deserialize)]
+struct OfferArgs {
+    swap: SwapArgs,
+    taker_sk: String,
+    lock_point: String,
+    coin_tx: String,
+    coin_vout: u32,
+    claim_tx: String,
+    maker_nonce: String,
+    parents: Vec<String>,
+    genesis: String,
+}
+
+/// Check the maker's claim of our coin, and sign it, locked to our point. The maker can't use this until we reveal the secret
+/// on Polygon, which pays us first. The nonce is made and used in this one call.
+#[wasm_bindgen]
+pub fn answer_claim_offer(args: &str) -> Result<String, String> {
+    let a: OfferArgs = parse(args)?;
+    let claim = tx(&a.claim_tx)?;
+    let coin = OutPoint::new(tx(&a.coin_tx)?.txid(), a.coin_vout);
+    let utxos = spent_from(&claim, &a.parents)?;
+    let (nonce, share) = answer_claim_with(
+        &keypair_from(&arr(&a.taker_sk)?)?,
+        &a.swap.output()?,
+        &coin,
+        &arr(&a.lock_point)?,
+        &nonce_from(&unhex(&a.maker_nonce)?).map_err(|e| e.to_string())?,
+        &claim,
+        &utxos,
+        genesis(&a.genesis)?,
+    )?;
+    Ok(json!({ "nonce": hex(&nonce_bytes(&nonce)), "share": hex(&share_bytes(&share)) }).to_string())
+}
+
+// ---- P to L: our claim of the maker's coin ----
+
+#[derive(Deserialize)]
+struct ClaimArgs {
+    swap: SwapArgs,
+    taker_sk: String,
+    lock_point: String,
+    coin_tx: String,
+    coin_vout: u32,
+    fee_tx: String,
+    fee_vout: u32,
+    to_address: String,
+    genesis: String,
+}
+
+enum Stage {
+    Started(TakerClaim),
+    Signed(SignedClaim),
+    Empty,
+}
+
+/// One signing session. Its nonce is held here and used once, and a page reload simply abandons the session.
+#[wasm_bindgen]
+pub struct ClaimSession {
+    stage: Stage,
+    key: Keypair,
+    output: SwapOutput,
+    point: [u8; 33],
+    tx: String,
+    nonce: String,
+}
+
+#[wasm_bindgen]
+impl ClaimSession {
+    #[wasm_bindgen(constructor)]
+    pub fn new(args: &str) -> Result<ClaimSession, String> {
+        let a: ClaimArgs = parse(args)?;
+        let blinding = secret(&a.swap.blinding_key)?;
+        let output = a.swap.output()?;
+        let key = keypair_from(&arr(&a.taker_sk)?)?;
+        let genesis = genesis(&a.genesis)?;
+        let coin = secret_coin(&a.coin_tx, a.coin_vout, &blinding)?;
+        let fee = secret_coin(&a.fee_tx, a.fee_vout, &blinding)?;
+        let to = payout_address(&a.to_address)?;
+        let (claim, utxos) = build_swap_spend(&coin, &fee, &to, 0, Sequence::MAX)?;
+        let tx_hex = serialize_hex(&claim);
+        let started = TakerClaim::start_with(&key, &output, claim, utxos, genesis)?;
+        let nonce = hex(&nonce_bytes(&started.nonce()));
+        Ok(ClaimSession {
+            stage: Stage::Started(started),
+            key,
+            output,
+            point: arr(&a.lock_point)?,
+            tx: tx_hex,
+            nonce,
+        })
+    }
+
+    pub fn tx(&self) -> String {
+        self.tx.clone()
+    }
+
+    pub fn nonce(&self) -> String {
+        self.nonce.clone()
+    }
+
+    /// Our share, given the maker's nonce. The session can't sign anything else after this.
+    pub fn sign(&mut self, maker_nonce: &str) -> Result<String, String> {
+        let Stage::Started(claim) = std::mem::replace(&mut self.stage, Stage::Empty) else {
+            return Err("this session has already signed".into());
+        };
+        let nonce = nonce_from(&unhex(maker_nonce)?).map_err(|e| e.to_string())?;
+        let (share, signed) = claim.sign(&self.key, &self.output, &self.point, &nonce)?;
+        self.stage = Stage::Signed(signed);
+        Ok(hex(&share_bytes(&share)))
+    }
+
+    /// What to keep while waiting for the maker's share. The nonce is used up by now, so this can't sign anything else.
+    pub fn signed_state(&self) -> Result<String, String> {
+        let Stage::Signed(signed) = &self.stage else {
+            return Err("this session hasn't signed".into());
+        };
+        Ok(json!({
+            "tx": serialize_hex(&signed.tx),
+            "message": hex(&signed.message),
+            "aggregate": hex(&aggregate_bytes(&signed.aggregate)),
+            "share": hex(&share_bytes(&signed.share)),
+            "maker_nonce": hex(&nonce_bytes(&signed.maker_nonce)),
+        })
+        .to_string())
+    }
+}
+
+#[derive(Deserialize)]
+struct FinishArgs {
+    swap: SwapArgs,
+    taker_sk: String,
+    lock_point: String,
+    lock_secret: String,
+    signed: SignedState,
+    parents: Vec<String>,
+    maker_share: String,
+    genesis: String,
+}
+
+#[derive(Deserialize)]
+struct SignedState {
+    tx: String,
+    message: String,
+    aggregate: String,
+    share: String,
+    maker_nonce: String,
+}
+
+/// The finished claim, once the maker's share checks out. **Publishing it reveals the secret to the maker.**
+#[wasm_bindgen]
+pub fn finish_claim(args: &str) -> Result<String, String> {
+    let a: FinishArgs = parse(args)?;
+    let t = tx(&a.signed.tx)?;
+    let utxos = spent_from(&t, &a.parents)?;
+    let signed = SignedClaim {
+        tx: t,
+        utxos,
+        message: arr(&a.signed.message)?,
+        aggregate: aggregate_from(&unhex(&a.signed.aggregate)?).map_err(|e| e.to_string())?,
+        share: share_from(&unhex(&a.signed.share)?).map_err(|e| e.to_string())?,
+        maker_nonce: nonce_from(&unhex(&a.signed.maker_nonce)?).map_err(|e| e.to_string())?,
+    };
+    let done = signed.finish(
+        &keypair_from(&arr(&a.taker_sk)?)?,
+        &a.swap.output()?,
+        &arr(&a.swap.maker_key)?,
+        share_from(&unhex(&a.maker_share)?).map_err(|e| e.to_string())?,
+        &arr(&a.lock_point)?,
+        &arr(&a.lock_secret)?,
+        genesis(&a.genesis)?,
+    )?;
+    Ok(serialize_hex(&done))
+}
+
+// ---- L to P: our refund ----
+
+#[derive(Deserialize)]
+struct RefundArgs {
+    swap: SwapArgs,
+    taker_sk: String,
+    coin_tx: String,
+    coin_vout: u32,
+    fee_tx: String,
+    fee_vout: u32,
+    to_address: String,
+    genesis: String,
+}
+
+/// Take back a coin we funded, through the refund leaf. Any coin at the address can come back this way, whatever it holds.
+#[wasm_bindgen]
+pub fn build_refund(args: &str) -> Result<String, String> {
+    let a: RefundArgs = parse(args)?;
+    let blinding = secret(&a.swap.blinding_key)?;
+    let output = a.swap.output()?;
+    let key = keypair_from(&arr(&a.taker_sk)?)?;
+    let genesis = genesis(&a.genesis)?;
+    let coin = secret_coin(&a.coin_tx, a.coin_vout, &blinding)?;
+    let fee = secret_coin(&a.fee_tx, a.fee_vout, &blinding)?;
+    let to = payout_address(&a.to_address)?;
+    let (t, utxos) = build_swap_spend(&coin, &fee, &to, a.swap.lock_height, Sequence::ZERO)?;
+    let digest = output.refund_sighash(&t, &utxos, 0, genesis).map_err(|e| e.to_string())?;
+    let signature = *Secp256k1::new().sign_schnorr_no_aux_rand(&Message::from_digest(digest), &key).as_ref();
+    let mut t = output.finalize_refund(t, &utxos, 0, genesis, signature).map_err(|e| e.to_string())?;
+    sign_keypath(&mut t, &utxos, 1, &key, genesis)?;
+    Ok(serialize_hex(&t))
+}
+
+// ---- L to P: an early refund, if the maker agrees ----
+
+/// Its nonce is held here and used once. A reload abandons it, and the maker will sign a fresh one.
+#[wasm_bindgen]
+pub struct EarlyRefundSession {
+    started: Option<EarlyRefund>,
+    key: Keypair,
+    output: SwapOutput,
+    maker_key: [u8; 33],
+    genesis: BlockHash,
+    tx: String,
+    nonce: String,
+}
+
+#[wasm_bindgen]
+impl EarlyRefundSession {
+    #[wasm_bindgen(constructor)]
+    pub fn new(args: &str) -> Result<EarlyRefundSession, String> {
+        let a: RefundArgs = parse(args)?;
+        let blinding = secret(&a.swap.blinding_key)?;
+        let output = a.swap.output()?;
+        let key = keypair_from(&arr(&a.taker_sk)?)?;
+        let genesis = genesis(&a.genesis)?;
+        let coin = secret_coin(&a.coin_tx, a.coin_vout, &blinding)?;
+        let fee = secret_coin(&a.fee_tx, a.fee_vout, &blinding)?;
+        let to = payout_address(&a.to_address)?;
+        // No lock height, because this spend doesn't wait for one. The maker's share is for exactly these outputs.
+        let (t, utxos) = build_swap_spend(&coin, &fee, &to, 0, Sequence::MAX)?;
+        let tx = serialize_hex(&t);
+        let started = EarlyRefund::start_with(&key, &output, t, utxos, genesis)?;
+        let nonce = hex(&nonce_bytes(&started.nonce()));
+        Ok(EarlyRefundSession { started: Some(started), key, output, maker_key: arr(&a.swap.maker_key)?, genesis, tx, nonce })
+    }
+
+    #[wasm_bindgen(getter)]
+    pub fn tx(&self) -> String {
+        self.tx.clone()
+    }
+
+    #[wasm_bindgen(getter)]
+    pub fn nonce(&self) -> String {
+        self.nonce.clone()
+    }
+
+    /// The finished refund, ready to send. A bad share from the maker is an error here, before anything is published.
+    pub fn finish(&mut self, maker_nonce: &str, maker_share: &str) -> Result<String, String> {
+        let started = self.started.take().ok_or("this session has already been used")?;
+        let (mut t, utxos) = started.finish(
+            &self.key,
+            &self.output,
+            &self.maker_key,
+            &nonce_from(&unhex(maker_nonce)?).map_err(|e| e.to_string())?,
+            share_from(&unhex(maker_share)?).map_err(|e| e.to_string())?,
+        )?;
+        sign_keypath(&mut t, &utxos, 1, &self.key, self.genesis)?;
+        Ok(serialize_hex(&t))
+    }
+}
+
+// ---- Nostr ----
+
+fn keys(sk: &str) -> Res<Keys> {
+    Ok(Keys::new(NostrSecret::from_hex(sk).map_err(|e| e.to_string())?))
+}
+
+fn pubkey(text: &str) -> Res<NostrKey> {
+    NostrKey::from_hex(text).map_err(|e| e.to_string())
+}
+
+/// A throwaway identity. A taker has no reputation to keep, and a new key per swap links nothing.
+#[wasm_bindgen]
+pub fn new_nostr_key() -> Result<String, String> {
+    let k = Keys::generate();
+    Ok(json!({ "secret": k.secret_key().to_secret_hex(), "public": k.public_key().to_hex() }).to_string())
+}
+
+#[wasm_bindgen]
+pub fn wrap_message(sk: &str, to: &str, id: &str, network: &str, body: &str, now: u64) -> Result<String, String> {
+    let body: Body = parse(body)?;
+    let envelope = Envelope { v: msg::VERSION, id: id.to_string(), network: network.to_string(), sent_at: now, body };
+    let (event, rumor) = wrap::wrap(&keys(sk)?, &pubkey(to)?, &envelope, now).map_err(|e| format!("{e:?}"))?;
+    Ok(json!({ "event": serde_json::from_str::<Value>(&event.as_json()).map_err(|e| e.to_string())?, "rumor_id": rumor })
+        .to_string())
+}
+
+/// Open a message, checking every layer, the network and its age. `null` for anything that fails: anyone can send us anything.
+#[wasm_bindgen]
+pub fn unwrap_message(sk: &str, event: &str, network: &str, now: u64) -> Result<String, String> {
+    let k = keys(sk)?;
+    let Ok(event) = Event::from_json(event) else { return Ok("null".into()) };
+    let Ok(got) = wrap::unwrap(&k, &event) else { return Ok("null".into()) };
+    if check_envelope(&got.envelope, network, now).is_err() {
+        return Ok("null".into());
+    }
+    Ok(json!({
+        "sender": got.sender.to_hex(),
+        "rumor_id": got.rumor_id,
+        "id": got.envelope.id,
+        "body": serde_json::to_value(&got.envelope.body).map_err(|e| e.to_string())?,
+    })
+    .to_string())
+}
+
+/// A Liquid transaction's id, which doesn't depend on hearing back from whoever it was sent to.
+#[wasm_bindgen]
+pub fn tx_id(hex: &str) -> Result<String, String> {
+    Ok(tx(hex)?.txid().to_string())
+}
+
+/// A maker's offer, with its author, or `null` if it is unsigned, expired or for another network.
+#[wasm_bindgen]
+pub fn read_offer(event: &str, network: &str, now: u64) -> Result<String, String> {
+    let Ok(event) = Event::from_json(event) else { return Ok("null".into()) };
+    let Some(offer) = wrap::read_offer(&event, network, now) else { return Ok("null".into()) };
+    let offer: Offer = offer;
+    Ok(json!({ "maker": event.pubkey.to_hex(), "created_at": event.created_at.as_secs(), "offer": offer }).to_string())
+}
+
+#[derive(Deserialize)]
+struct RulesArgs {
+    network: String,
+    usdt_asset: String,
+    chain_id: u64,
+    escrow: String,
+    token: String,
+    l2p_min_blocks: u32,
+    l2p_max_blocks: u32,
+    p2l_min_blocks: u32,
+    p2l_max_blocks: u32,
+    l2p_min_window_secs: u64,
+    l2p_max_window_secs: u64,
+    p2l_max_window_secs: u64,
+    max_spread_bps: u32,
+}
+
+impl RulesArgs {
+    fn rules(self) -> TakerRules {
+        TakerRules {
+            network: self.network,
+            usdt_asset: self.usdt_asset,
+            chain_id: self.chain_id,
+            escrow: self.escrow.to_ascii_lowercase(),
+            token: self.token.to_ascii_lowercase(),
+            template_version: msg::TEMPLATE_VERSION,
+            l2p_min_blocks: self.l2p_min_blocks,
+            l2p_max_blocks: self.l2p_max_blocks,
+            p2l_min_blocks: self.p2l_min_blocks,
+            p2l_max_blocks: self.p2l_max_blocks,
+            l2p_min_window_secs: self.l2p_min_window_secs,
+            l2p_max_window_secs: self.l2p_max_window_secs,
+            p2l_max_window_secs: self.p2l_max_window_secs,
+            max_spread_bps: self.max_spread_bps,
+        }
+    }
+}
+
+fn pair(direction: &str) -> Res<Pair> {
+    match direction {
+        "L2P" => Ok(msg::L2P),
+        "P2L" => Ok(msg::P2L),
+        _ => Err("an unknown direction".into()),
+    }
+}
+
+/// `""` if the quote is acceptable, or why it isn't.
+#[wasm_bindgen]
+pub fn quote_problem(rules: &str, request: &str, quote: &str, now: u64) -> Result<String, String> {
+    let r: RulesArgs = parse(rules)?;
+    let (request, quote): (Request, Quote) = (parse(request)?, parse(quote)?);
+    Ok(check_quote(&r.rules(), &request, &quote, now).err().map_or(String::new(), |e| format!("{e:?}")))
+}
+
+/// `""` if the terms are acceptable, or why they aren't. This is the last check before funding, with `tip` from our own chain view.
+#[wasm_bindgen]
+pub fn terms_problem(
+    rules: &str,
+    direction: &str,
+    quote: &str,
+    accept_rumor: &str,
+    terms: &str,
+    tip: u32,
+) -> Result<String, String> {
+    let r: RulesArgs = parse(rules)?;
+    let (quote, terms): (Quote, MakerTerms) = (parse(quote)?, parse(terms)?);
+    Ok(check_terms(&r.rules(), pair(direction)?, &quote, accept_rumor, &terms, tip).err().map_or(String::new(), |e| format!("{e:?}")))
+}
+
+// ---- Polygon ----
+//
+// The page sends these through the taker's own wallet, as `{to, data, value}`, and reads the chain with `eth_call`. The
+// encoding is the shared code the maker signs with, so the two can't drift apart.
+
+fn evm(text: &str) -> Res<EvmAddress> {
+    EvmAddress::parse(text.trim())
+}
+
+fn amount(text: &str) -> Res<u128> {
+    text.parse().map_err(|_| format!("bad amount {text:?}"))
+}
+
+fn data(bytes: &[u8]) -> String {
+    format!("0x{}", to_hex(bytes))
+}
+
+/// What is wrong with a Polygon address to be paid at, or nothing. A mixed-case address must carry its checksum, and the
+/// zero address would burn what it is sent.
+#[wasm_bindgen]
+pub fn polygon_address_problem(address: &str) -> String {
+    match evm(address) {
+        Err(_) if address.trim().len() == 42 && address.trim().starts_with("0x") => {
+            "This address's checksum is wrong. Copy it again from your wallet.".into()
+        }
+        Err(_) => "This isn't a Polygon address.".into(),
+        Ok(a) if a == EvmAddress::ZERO => "That is the zero address, which nobody can spend from.".into(),
+        Ok(_) => String::new(),
+    }
+}
+
+/// The checksummed form of an address.
+#[wasm_bindgen]
+pub fn checksummed(address: &str) -> Result<String, String> {
+    Ok(evm(address)?.checksummed())
+}
+
+/// The escrow's id for a lock: by who made it, and the address it locks to.
+#[wasm_bindgen]
+pub fn lock_id(initiator: &str, lock_address: &str) -> Result<String, String> {
+    Ok(format!("0x{}", hex(&id_of(&evm(initiator)?, &evm(lock_address)?))))
+}
+
+fn id(text: &str) -> Res<[u8; 32]> {
+    arr(text.strip_prefix("0x").unwrap_or(text))
+}
+
+/// Calldata for `locks(id)`, which `parse_lock` reads.
+#[wasm_bindgen]
+pub fn locks_call(lock_id: &str) -> Result<String, String> {
+    Ok(data(&liq2any_chain::evm::calldata("locks(bytes32)", &[liq2any_chain::evm::Word::Bytes32(id(lock_id)?)])))
+}
+
+/// A lock, as `locks(id)` returns it. Amounts are strings; `state` is none, open, claimed or refunded.
+#[wasm_bindgen]
+pub fn parse_lock(result: &str) -> Result<String, String> {
+    let l = Lock::decode(&from_hex(result.strip_prefix("0x").unwrap_or(result))?)?;
+    let state = match l.state {
+        LockState::None => "none",
+        LockState::Open => "open",
+        LockState::Claimed => "claimed",
+        LockState::Refunded => "refunded",
+    };
+    Ok(json!({
+        "initiator": l.initiator.checksummed(),
+        "deadline_time": l.deadline_time,
+        "state": state,
+        "long_leg": l.long_leg,
+        "extended": l.extended,
+        "recipient": l.recipient.checksummed(),
+        "deadline_block": l.deadline_block,
+        "lock_address": l.lock_address.checksummed(),
+        "gas_drop": l.gas_drop.to_string(),
+        "amount": l.amount.to_string(),
+        "revealed": hex(&l.revealed),
+    })
+    .to_string())
+}
+
+/// Calldata for a token's `balanceOf`, `isBlocked` or `allowance`. Each returns one word.
+#[wasm_bindgen]
+pub fn token_call(what: &str, who: &str, spender: &str) -> Result<String, String> {
+    use liq2any_chain::evm::{calldata, Word};
+    let who = Word::Address(evm(who)?);
+    Ok(data(&match what {
+        "balance" => calldata("balanceOf(address)", &[who]),
+        "blocked" => calldata("isBlocked(address)", &[who]),
+        "allowance" => calldata("allowance(address,address)", &[who, Word::Address(evm(spender)?)]),
+        _ => return Err(format!("unknown token call {what:?}")),
+    }))
+}
+
+/// P→L: lock the taker's USDT0 to the point, for the maker, as a long leg with no gas drop.
+#[wasm_bindgen]
+pub fn build_lock_call(
+    lock_address: &str,
+    recipient: &str,
+    amount_units: &str,
+    deadline_time: u64,
+    deadline_block: u64,
+) -> Result<String, String> {
+    Ok(data(&lock_call(
+        &evm(lock_address)?,
+        &evm(recipient)?,
+        amount(amount_units)?,
+        deadline_time,
+        deadline_block,
+        true,
+        &EvmAddress::ZERO,
+    )))
+}
+
+/// L→P: claim the maker's lock. **This carries the secret's value.** The caller simulates first, and sends only after that.
+#[wasm_bindgen]
+pub fn build_claim_call(lock_id: &str, revealed: &str) -> Result<String, String> {
+    Ok(data(&claim_call(&id(lock_id)?, &arr(revealed)?)))
+}
+
+/// P→L: take back our lock after its deadlines. Anyone may send this, and it can only pay the initiator.
+#[wasm_bindgen]
+pub fn build_refund_call(lock_id: &str) -> Result<String, String> {
+    Ok(data(&refund_call(&id(lock_id)?)))
+}
+
+/// Let the escrow take this much of the taker's USDT0, for its lock.
+#[wasm_bindgen]
+pub fn build_approve_call(spender: &str, amount_units: &str) -> Result<String, String> {
+    Ok(data(&approve_call(&evm(spender)?, amount(amount_units)?)))
+}
+
+/// Test networks only: the stand-in token's own faucet, which mints up to 1,000 to whoever calls it.
+#[wasm_bindgen]
+pub fn build_faucet_call(amount_units: &str) -> Result<String, String> {
+    use liq2any_chain::evm::{calldata, Word};
+    Ok(data(&calldata("faucet(uint256)", &[Word::Uint(amount(amount_units)?)])))
+}

@@ -1773,6 +1773,119 @@ fn rfq_p2l_swap(w: &mut World) -> Res<()> {
     Ok(())
 }
 
+/// Anvil's accounts #4, the page's own wallet in the browser test, and #5, the second maker's Polygon key.
+const PAGE_KEY: &str = "0x47e179ec197488593b187f80a00eb0da91f1b9d0b13f8733639f19c30a34926a";
+const SECOND_MAKER_KEY: &str = "0x8b3a350cf5c34c9194ca85829a2df0ec3153be0318b5e2d3348e872092edffba";
+
+/// Another maker on the same chains and relay, dearer than the first, so a large order has somewhere to split to. It is the
+/// first one's configuration, with its own Liquid wallet, Polygon key, Nostr key and stores.
+struct SecondMaker {
+    _daemon: Proc,
+    _signer: Proc,
+    store: Store,
+}
+
+fn start_second_maker(w: &World) -> Res<SecondMaker> {
+    const BPS: u32 = 180;
+    let first = w.daemon_config.parent().ok_or("no root")?;
+    let root = first.join("second");
+    let keys = root.join("keys");
+    std::fs::create_dir_all(&keys).map_err(err)?;
+    std::fs::write(keys.join("polygon.key"), from_hex(SECOND_MAKER_KEY)?).map_err(err)?;
+    w.evm.send(SECOND_MAKER_KEY, &w.evm.token, "faucet(uint256)", &["1000000000"])?;
+
+    let read = |p: &Path| std::fs::read_to_string(p).map_err(err);
+    let mut signer: SignerConfig = serde_json::from_str(&read(&first.join("signer.json"))?).map_err(err)?;
+    let mut cfg: Config = serde_json::from_str(&read(&w.daemon_config)?).map_err(err)?;
+    let socket = std::env::temp_dir().join(format!("l2a-{}", std::process::id())).join("second-signer.sock");
+    signer.socket = socket.clone();
+    signer.ledger = root.join("signer.db");
+    signer.keys_dir = keys;
+    let signer_path = root.join("signer.json");
+    std::fs::write(&signer_path, serde_json::to_string(&signer).map_err(err)?).map_err(err)?;
+    let signer_proc = Proc { child: Command::new(signer_binary()).arg(&signer_path).spawn().map_err(err)? };
+    let mut client = w.wait_for("the second signer", 60, || Ok(Client::connect(&socket).ok()))?;
+    let Reply::Identity { liquid_address, .. } = client.call(&Call::Identity)? else {
+        return Err("no identity".into());
+    };
+    for _ in 0..8 {
+        w.node.fund(&liquid_address, 200_000, "bitcoin");
+    }
+    w.node.fund(&liquid_address, 40 * LIQ_AMOUNT, &usdt().to_string());
+
+    cfg.db = root.join("maker.db");
+    cfg.signer_socket = socket;
+    cfg.pages = root.join("pages.log");
+    let rfq = cfg.rfq.as_mut().ok_or("no rfq config")?;
+    rfq.nostr_key = root.join("nostr.key");
+    for pair in &mut rfq.pairs {
+        pair.prices = vec![msg::PriceTier { up_to: Units(RFQ_MAX), bps: BPS }];
+    }
+    let config = root.join("maker.json");
+    std::fs::write(&config, serde_json::to_string(&cfg).map_err(err)?).map_err(err)?;
+    let log = std::fs::File::create(PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("second-daemon.log")).map_err(err)?;
+    let daemon = Command::new(env!("CARGO_BIN_EXE_liq2any-maker")).arg(&config).stdout(log).spawn().map_err(err)?;
+    let store = w.wait_for("the second maker's store", 30, || Ok(Store::open(&root.join("maker.db")).ok()))?;
+    Ok(SecondMaker { _daemon: Proc { child: daemon }, _signer: signer_proc, store })
+}
+
+/// The real page in a real browser, against this daemon, node and anvil. See client/test/drive.mjs. Only runs with
+/// `CLIENT_TEST`, on anvil, because it needs `npm ci` in client/ and a built client (client/build.sh).
+fn browser_client(w: &mut World) -> Res<()> {
+    if std::env::var("CLIENT_TEST").is_err() || w.evm.public() {
+        println!("    skipped: set CLIENT_TEST=1, on anvil");
+        return Ok(());
+    }
+    let second = start_second_maker(w)?;
+    // The page's wallet holds tUSDT0 from the faucet, and anvil's test POL.
+    let page_wallet = address_of(PAGE_KEY);
+    w.evm.send(PAGE_KEY, &w.evm.token, "faucet(uint256)", &["1000000000"])?;
+    let dir = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../client"));
+    let wallet_args = serde_json::to_string(&w.node.rpc.args).map_err(err)?;
+    let amount = RFQ_SEND as f64 / 1e6;
+    let output = Command::new("node")
+        .arg(dir.join("test/drive.mjs"))
+        .env("ELEMENTS_CLI", &w.node.rpc.cli)
+        .env("ELEMENTS_ARGS", wallet_args)
+        .env("USDT", usdt().to_string())
+        .env("LBTC", lbtc().to_string())
+        .env("NETWORK_NAME", NETWORK)
+        .env("RELAY_URL", &w.relay_url)
+        .env("POLYGON_RPC", &w.evm.url)
+        .env("ESCROW", w.evm.escrow.checksummed())
+        .env("TOKEN", w.evm.token.checksummed())
+        .env("TAKER_POLYGON", page_wallet.checksummed())
+        .env("AMOUNT", format!("{amount}"))
+        .env("SPLIT_AMOUNT", format!("{}", (RFQ_MAX + RFQ_SEND / 2) as f64 / 1e6))
+        .env("SHOTS_DIR", PathBuf::from(env!("CARGO_TARGET_TMPDIR")))
+        .stderr(Stdio::inherit())
+        .output()
+        .map_err(err)?;
+    let text = String::from_utf8_lossy(&output.stdout).to_string();
+    print!("{text}");
+    if !output.status.success() {
+        for (terms, state) in w.store.open_swaps().map_err(err)? {
+            println!("    the maker has {} at {state:?}", terms.lock_point.to_hex());
+        }
+    }
+    check(output.status.success(), "the page ran every scenario")?;
+    // The page says it finished. The makers' own stores must agree they were paid.
+    for line in text.lines().filter_map(|l| l.strip_prefix("SWAP ")) {
+        let point = LockPoint::from_hex(line).ok_or("bad swap line")?;
+        if w.store.state(&point.id()).map_err(err)?.is_some() {
+            w.wait_state(&point.id(), "the maker completing the page's swap", 120, done(Outcome::Completed))?;
+        } else {
+            let finished = done(Outcome::Completed);
+            w.wait_for("the second maker completing the page's swap", 120, || {
+                let state = second.store.state(&point.id()).map_err(err)?;
+                Ok(state.filter(|(_, s)| finished(s)))
+            })?;
+        }
+    }
+    println!("    ok: the makers completed each of the page's swaps");
+    Ok(())
+}
+
 /// A taker speaking the wire protocol by hand, so it can break the rules.
 struct RawTaker {
     keys: Keys,
@@ -2368,6 +2481,7 @@ fn the_daemon_runs_real_swaps() {
         ("RFQ wrong coin refunded early", rfq_early_refund_wrong_coin),
         ("RFQ P2L release", rfq_p2l_release),
         ("RFQ P2L cancel", rfq_p2l_cancel),
+        ("browser client", browser_client),
     ];
     let filter = std::env::var("SCENARIO").unwrap_or_default();
     let mut failures = vec![];

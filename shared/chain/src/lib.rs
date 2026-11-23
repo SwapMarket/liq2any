@@ -6,6 +6,6 @@
 pub mod esplora;
 pub mod evm;
 pub mod liquid;
-#[cfg(feature = "native")]
+/// Its encoding and decoding build everywhere, the browser included; only its RPC client is native.
 pub mod polygon;
 pub mod swap;

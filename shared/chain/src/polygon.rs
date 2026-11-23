@@ -2,11 +2,15 @@
 //! the maker sends. Specification: docs/design.md sections 2 and 4.
 
 use std::sync::OnceLock;
+#[cfg(feature = "native")]
 use std::time::Duration;
 
+#[cfg(feature = "native")]
 use serde_json::{json, Value};
 
-use crate::evm::{calldata, from_hex, keccak256, to_hex, word, word_address, word_bool, word_u128, Address, Word};
+#[cfg(feature = "native")]
+use crate::evm::to_hex;
+use crate::evm::{calldata, from_hex, keccak256, word, word_address, word_bool, word_u128, Address, Word};
 use crate::liquid::{check_genesis, use_network, Net, NetworkConfig, POLYGON_MAINNET_CHAIN_ID};
 
 pub type Res<T> = Result<T, String>;

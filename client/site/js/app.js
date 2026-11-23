@@ -1,0 +1,1914 @@
+// The page. It shows state and takes decisions from the user. js/swap.js and the WASM do the protocol.
+import init, * as W from '../wasm/liq2any_client_wasm.js';
+import { NETWORK, checkGenesis, chooseNetwork, confirmationsFor, mainnetAvailable } from './config.js';
+import { Esplora, Polygon } from './chain.js';
+import { bpsAt, effectivePrice, largestFor, planOrder, sendLimits } from './plan.js';
+import { Relays } from './relay.js';
+import { CANCELLABLE, Engine, FINISHED, deriveSwap, phase, rulesJson } from './swap.js';
+import { loadSettings, loadSwaps, removeSwap, saveSettings, saveSwap, withSwap } from './store.js';
+import { captureConsole, clearLogs, log, logsCount, logsText } from './logs.js';
+import { makeRecovery, offerDownload, readRecovery, readRecoveryFiles, recoveryCodes } from './recovery.js';
+import { nsiteGateway, nsiteUrl, siteUrl } from './sites.js';
+import { anyVetted, vettedMaker } from './vetted.js';
+import { connectExtension, connectWalletConnect, extensionWallets, restoreWalletConnect } from './wallet.js';
+
+const OFFER_KIND = 38401;
+const WRAP_KIND = 21059;
+const $ = (id) => document.getElementById(id);
+const now = () => Math.floor(Date.now() / 1000);
+
+let settings = loadSettings();
+let wallet = null;
+let relays = null;
+let engine = null;
+let esplora = [];
+let polygon = null;
+const offers = new Map();
+// Fills being negotiated, by the throwaway Nostr key each one uses.
+const negotiations = new Map();
+const ui = { direction: 'L2P', amount: '', to: '', selected: null, openOrder: null, quote: null };
+
+// ---- Small DOM helper. Text always goes in as text, so nothing from a relay can become markup. ----
+function h(tag, props = {}, ...children) {
+  const el = document.createElement(tag);
+  for (const [k, v] of Object.entries(props ?? {})) {
+    if (k.startsWith('on')) el.addEventListener(k.slice(2), v);
+    else if (k === 'class') el.className = v;
+    else if (k in el && k !== 'list') el[k] = v;
+    else el.setAttribute(k, v);
+  }
+  for (const c of children.flat()) if (c !== null && c !== undefined && c !== false) el.append(c);
+  return el;
+}
+
+const units = (text) => {
+  const m = /^(\d*)(?:\.(\d{0,6}))?$/.exec(text.trim());
+  if (!m || (!m[1] && !m[2])) return null;
+  return BigInt(m[1] || '0') * 1000000n + BigInt((m[2] || '').padEnd(6, '0'));
+};
+const show = (u) => {
+  const v = BigInt(u);
+  const frac = (v % 1000000n).toString().padStart(6, '0').replace(/0+$/, '');
+  return `${(v / 1000000n).toLocaleString('en-US')}${frac ? `.${frac}` : ''}`;
+};
+// The book's sizes, to two places, rounded the cautious way: a minimum up, and a maximum or what's available down.
+const STEP = 10000n;
+const sizeUp = (u) => (((BigInt(u) + STEP - 1n) / STEP) * STEP);
+const sizeDown = (u) => ((BigInt(u) / STEP) * STEP);
+// A limit as 1,000.00, or exactly, if rounding it to cents wouldn't fill.
+const limitText = (u) => (BigInt(u) % STEP === 0n ? size(u) : show(u));
+const size = (u) => {
+  const v = BigInt(u);
+  return `${(v / 1000000n).toLocaleString('en-US')}.${((v % 1000000n) / STEP).toString().padStart(2, '0')}`;
+};
+// What the taker pays per unit received, to four places, so a worse price is a higher number. Quotes and payments stay exact: a coin
+// must match to the last unit.
+const price = (bpsValue) => (10000 / (10000 - bpsValue)).toFixed(4);
+const liquidUnits = (u) => {
+  const v = BigInt(u);
+  return `${v / 100000000n}.${(v % 100000000n).toString().padStart(8, '0')}`;
+};
+const short = (s) => `${s.slice(0, 8)}…${s.slice(-6)}`;
+const names = { L2P: ['L-USDt', NETWORK.tokenName], P2L: [NETWORK.tokenName, 'L-USDt'] };
+
+function coinPill(name) {
+  const liquid = name.startsWith('L');
+  return h('span', { class: 'pill' }, h('img', { class: 'coin', src: liquid ? 'liquid.svg' : 'polygon.svg', alt: '', width: 26, height: 26 }), name);
+}
+
+function fail(e) {
+  // Closing a dialog to stop is the person's own choice, not a failure.
+  if (e?.closedByUser) return;
+  log('error', e);
+  const banner = $('banner');
+  banner.textContent = (e?.message ?? String(e)).split('api-key=')[0];
+  banner.hidden = false;
+  clearTimeout(fail.timer);
+  fail.timer = setTimeout(() => { banner.hidden = true; }, 15000);
+}
+
+// ---- Connections ----
+function endpoints() {
+  esplora = (settings.esplora ?? NETWORK.esplora).filter(Boolean).map((u) => new Esplora(u));
+  polygon = new Polygon(settings.polygon || NETWORK.polygon[0]);
+}
+
+// The second Polygon source, which a claim waits on to agree. An empty setting means none.
+function secondPolygon() {
+  const url = settings.polygon2 ?? NETWORK.polygon[1];
+  return url ? new Polygon(url) : null;
+}
+
+function startRelays() {
+  relays?.close();
+  relays = new Relays(settings.relays ?? NETWORK.relays, onEvent);
+  relays.subscribe('offers', { kinds: [OFFER_KIND], since: now() - 3600 });
+  for (const s of Object.values(loadSwaps())) watch(s);
+  engine.relays = relays;
+}
+
+function watch(s) {
+  if (FINISHED.includes(s.state)) return;
+  relays.subscribe(`swap-${s.id.slice(0, 12)}`, { kinds: [WRAP_KIND], '#p': [s.nostr.public], since: now() - 300 });
+}
+
+function onEvent(event) {
+  const text = JSON.stringify(event);
+  if (event.kind === OFFER_KIND) {
+    const got = JSON.parse(W.read_offer(text, NETWORK.name, BigInt(now())));
+    if (!got) return;
+    const known = offers.get(got.maker);
+    // Checked when it arrives, and again by the book, so a maker that stops publishing drops off an open page too.
+    got.expires_at = Number(event.tags.find((t) => t[0] === 'expiration')?.[1] ?? 0);
+    if (!known || known.created_at <= got.created_at) offers.set(got.maker, got);
+    // Messages carry the time, so a clock far from a maker's would get them refused.
+    if (Math.abs(now() - got.created_at) > 3600 * 24) return;
+    updateForm();
+    return;
+  }
+  if (event.kind !== WRAP_KIND) return;
+  const to = event.tags.find((t) => t[0] === 'p')?.[1];
+  const talking = negotiations.get(to);
+  if (talking) {
+    const got = JSON.parse(W.unwrap_message(talking.nostr.secret, text, NETWORK.name, BigInt(now())));
+    if (got) talking.onMessage(got);
+    return;
+  }
+  const s = Object.values(loadSwaps()).find((x) => x.nostr.public === to && !FINISHED.includes(x.state));
+  if (!s) return;
+  const got = JSON.parse(W.unwrap_message(s.nostr.secret, text, NETWORK.name, BigInt(now())));
+  if (got) withSwap(s.id, (fresh) => engine.onMessage(fresh, got)).catch(fail);
+}
+
+// ---- The makers book ----
+const CHAINS = { L2P: ['liquid', 'polygon'], P2L: ['polygon', 'liquid'] };
+const pairOf = (o, direction) => o.offer.pairs.find((p) => p.from === CHAINS[direction][0] && p.to === CHAINS[direction][1]);
+// An offer for another escrow, token or chain can't be filled here: the terms would be refused, so it isn't shown either.
+const ourChain = (o) => {
+  const p = o.offer.chains?.polygon;
+  return p && p.chain_id === NETWORK.chainId && p.escrow.toLowerCase() === NETWORK.escrow.toLowerCase() && p.token.toLowerCase() === NETWORK.token.toLowerCase();
+};
+const liveOffers = (direction) => [...offers.values()]
+  .filter((o) => o.expires_at > now() && ourChain(o) && pairOf(o, direction)?.prices.length)
+  .sort((a, b) => tiersOf(a, direction)[0].bps - tiersOf(b, direction)[0].bps);
+const tiersOf = (o, direction) => pairOf(o, direction).prices.map((t) => ({ up_to: BigInt(t.up_to), bps: t.bps }));
+const available = (o, direction) => BigInt(pairOf(o, direction).available);
+
+// Saved with the settings, so they outlast this visit.
+const favorites = () => new Set(settings.favorites ?? []);
+
+function toggleFavorite(maker) {
+  const set = favorites();
+  if (!set.delete(maker)) set.add(maker);
+  settings.favorites = [...set];
+  saveSettings(settings);
+  updateForm();
+}
+
+function setOnlyFavorites(on) {
+  settings.onlyFavorites = on;
+  saveSettings(settings);
+  updateForm();
+}
+
+// On unless the taker turned it off, because a new visitor has no favorites and fake offers cost nothing to publish. With nobody
+// vetted on this network yet, it would hide every offer, so it is off until someone is.
+const onlyVetted = () => anyVetted(NETWORK.name) && settings.onlyVetted !== false;
+
+function setOnlyVetted(on) {
+  settings.onlyVetted = on;
+  saveSettings(settings);
+  updateForm();
+}
+
+// The makers an order can use. Hidden ones aren't offered anything.
+const shownOffers = (direction) => {
+  const fav = favorites();
+  const list = liveOffers(direction);
+  return list
+    .filter((o) => (!settings.onlyFavorites || fav.has(o.maker)) && (!onlyVetted() || vettedMaker(NETWORK.name, o.maker)))
+    .sort((a, b) => Number(fav.has(b.maker)) - Number(fav.has(a.maker)));
+};
+
+// Mainnet's cap on one swap. An order can still be split across makers, each within it.
+const capped = (units) => (NETWORK.maxSwapUnits && units > NETWORK.maxSwapUnits ? NETWORK.maxSwapUnits : units);
+
+const overCap = (terms) => !!NETWORK.maxSwapUnits && (BigInt(terms.polygon_amount) > NETWORK.maxSwapUnits || BigInt(terms.liquid_amount) > NETWORK.maxSwapUnits * 100n);
+
+const planMakers = () => shownOffers(ui.direction).map((o) => ({
+  maker: o.maker, tiers: tiersOf(o, ui.direction), min: BigInt(pairOf(o, ui.direction).min), max: capped(BigInt(pairOf(o, ui.direction).max)), available: available(o, ui.direction),
+}));
+
+function currentPlan(send) {
+  return planOrder(send ?? 0n, planMakers(), ui.selected, settings.maxSpreadBps ?? NETWORK.maxSpreadBps, favorites());
+}
+
+// The smallest and largest orders the shown makers can fill, at two places when that still fills, or else exact.
+function currentLimits() {
+  const limits = sendLimits(planMakers(), ui.selected, settings.maxSpreadBps ?? NETWORK.maxSpreadBps, favorites());
+  if (!limits) return null;
+  const whole = (send) => {
+    const plan = currentPlan(send);
+    return plan.fills.length > 0 && plan.unfilled === 0n;
+  };
+  const min = sizeUp(limits.min);
+  const max = sizeDown(limits.max);
+  const out = { min: whole(min) ? min : limits.min, max: whole(max) ? max : limits.max };
+  // P→L can't send more than the connected wallet holds.
+  const holds = ui.direction === 'P2L' && wallet && walletUsdt.address === wallet.address ? walletUsdt.units : null;
+  if (holds !== null && holds < out.max) {
+    // In whole cents too, so it reads like the rest: the most the wallet holds that still fills.
+    const cents = sizeDown(holds);
+    return { ...out, max: cents >= out.min && whole(cents) ? cents : holds, capped: true };
+  }
+  return out;
+}
+
+// The connected wallet's USDT0 and POL, read now and then for the P→L form's largest amount.
+const walletUsdt = { address: null, units: null, wei: null, at: 0 };
+
+function refreshWalletUsdt() {
+  if (!wallet || (walletUsdt.address === wallet.address && Date.now() - walletUsdt.at < 15_000)) return;
+  const address = wallet.address;
+  walletUsdt.at = Date.now();
+  Promise.all([polygon.tokenBalance(NETWORK.token, address), polygon.balance(address)]).then(([units, wei]) => {
+    const changed = walletUsdt.address !== address || walletUsdt.units !== units || walletUsdt.wei !== wei;
+    Object.assign(walletUsdt, { address, units, wei });
+    if (!changed || wallet?.address !== address) return;
+    for (const el of document.querySelectorAll('.wallet-balances')) el.textContent = balancesText();
+    updateForm();
+  }).catch(() => {});
+}
+
+const pol = (wei) => `${(Number(wei) / 1e18).toFixed(4)} POL`;
+
+// The connected wallet's USDT0 and POL, once read.
+function balancesText() {
+  if (!wallet || walletUsdt.address !== wallet.address || walletUsdt.units === null) return '';
+  return ` · ${show(walletUsdt.units)} ${NETWORK.tokenName} · ${pol(walletUsdt.wei)}`;
+}
+
+function setAmount(send) {
+  ui.amount = show(send).replaceAll(',', '');
+  amountInput.value = ui.amount;
+  updateForm();
+}
+
+// Change what's on screen only if it differs, so a selection, a hover or a tap in progress isn't disturbed.
+function setText(el, text, title) {
+  if (el.textContent !== text) el.textContent = text;
+  if (title !== undefined && el.title !== title) el.title = title;
+}
+
+// Rebuild a part of the form only when what it shows has changed.
+function slot(el, key, build) {
+  if (el.dataset.key === key) return;
+  el.dataset.key = key;
+  el.replaceChildren(...[build()].flat().filter(Boolean));
+}
+
+// The sizes this maker takes now: from its minimum up to the most it can pay for, which can be below its limit per swap.
+function sizeRange(o, direction, tiers) {
+  const pair = pairOf(o, direction);
+  const largest = largestFor({ maker: o.maker, tiers, min: BigInt(pair.min), max: capped(BigInt(pair.max)), available: available(o, direction) });
+  if (largest === null) return 'none now';
+  return `≥${size(sizeUp(pair.min))}\n≤${size(sizeDown(largest))}`;
+}
+
+// What to show for one maker: with an order typed in, the price and size of that order, and otherwise what the maker quotes.
+function bookCells(o, direction, send, fills) {
+  const tiers = tiersOf(o, direction);
+  const ladder = tiers.map((t) => `up to ${size(sizeDown(t.up_to))}: ${price(t.bps)}`).join('\n');
+  const max = BigInt(pairOf(o, direction).max);
+  if (fills.length) {
+    return { rate: effectivePrice(fills).toFixed(4), ladder, size: size(sizeUp(fills.reduce((sum, f) => sum + f.send, 0n))) };
+  }
+  if (send && send > 0n) return { rate: price(bpsAt(tiers, send < max ? send : max) ?? tiers[0].bps), ladder, size: '–' };
+  return {
+    rate: tiers.length > 1 ? tiers.map((t, i) => (i ? `>${size(sizeDown(tiers[i - 1].up_to))}` : `≤${size(sizeDown(t.up_to))}`) + `: ${price(t.bps)}`).join('\n') : price(tiers[0].bps),
+    ladder,
+    size: sizeRange(o, direction, tiers),
+  };
+}
+
+// The book stays on the page for the whole visit, and each update touches only the cells that changed.
+const book = {
+  rows: new Map(),
+  title: h('h3'),
+  headers: ['Maker', 'Price', 'Size'].map((t) => h('th', {}, t)),
+  body: h('tbody'),
+  empty: h('div', { class: 'empty' }),
+  onlyVetted: h('input', { type: 'checkbox', id: 'only-vetted', onchange: (e) => setOnlyVetted(e.target.checked) }),
+  onlyFavorites: h('input', { type: 'checkbox', id: 'only-favorites', onchange: (e) => setOnlyFavorites(e.target.checked) }),
+  warning: h('p', { class: 'note', id: 'unvetted-warning' },
+    'Anyone can publish an offer. A maker who never follows through can\'t take your funds, but it can hold them until the refund, for about 8 hours or more.'),
+};
+book.table = h('table', {}, h('thead', {}, h('tr', {}, book.headers)), book.body);
+book.el = h('div', { class: 'book' }, book.title,
+  h('div', { class: 'scroll' }, book.table, book.empty),
+  h('div', { class: 'book-filters' },
+    // Nobody is vetted on this network yet, so there is nothing to filter for.
+    anyVetted(NETWORK.name) && h('label', { class: 'check' }, book.onlyVetted, 'Only vetted by SwapMarket'),
+    h('label', { class: 'check' }, book.onlyFavorites, 'Only my favorites')),
+  book.warning);
+
+function newBookRow(maker) {
+  const star = h('button', { class: 'star', onclick: (e) => { e.stopPropagation(); toggleFavorite(maker); } });
+  const vetted = vettedMaker(NETWORK.name, maker);
+  const row = { star, rate: h('td', { class: 'rate' }), size: h('td', { class: 'size' }) };
+  row.el = h('tr', { onclick: () => { ui.selected = ui.selected === maker ? null : maker; updateForm(); } },
+    h('td', { class: 'mono', title: maker },
+      h('div', { class: 'maker-cell' }, star, h('span', {}, short(maker)),
+        vetted && h('span', { class: 'vetted', title: `Vetted by SwapMarket: ${vetted.name}`, 'aria-label': 'Vetted by SwapMarket' }, '✓'))),
+    row.rate, row.size);
+  return row;
+}
+
+const pageStarted = Date.now();
+const LOOK_FOR_OFFERS_MS = 15000;
+
+function updateBook(send) {
+  const direction = ui.direction;
+  const [from, to] = names[direction];
+  const list = shownOffers(direction);
+  const plan = currentPlan(send);
+  const fav = favorites();
+  const ordered = send && send > 0n;
+
+  setText(book.title, `Makers book: ${from} → ${to}`);
+  setText(book.headers[0], 'Maker', 'The maker\'s Nostr key');
+  setText(book.headers[1], 'Price', ordered
+    ? `What you pay per ${to} on this order, in ${from}`
+    : `${from} you pay for each ${to} you receive`);
+  setText(book.headers[2], ordered ? 'Your fill' : 'Size', ordered
+    ? `How much of your order goes to this maker, in ${from}`
+    : `The smallest and largest single swap, in ${from} and ${to} alike`);
+
+  const seen = new Set();
+  list.forEach((o, at) => {
+    seen.add(o.maker);
+    const row = book.rows.get(o.maker) ?? newBookRow(o.maker);
+    book.rows.set(o.maker, row);
+    const mine = plan.fills.filter((f) => f.maker === o.maker);
+    const cells = bookCells(o, direction, send, mine);
+    setText(row.rate, cells.rate, cells.ladder);
+    setText(row.size, cells.size);
+    row.el.classList.toggle('on', mine.length > 0);
+    const on = fav.has(o.maker);
+    setText(row.star, on ? '★' : '☆', on ? 'Remove from favorites' : 'Add to favorites');
+    row.star.classList.toggle('on', on);
+    row.star.setAttribute('aria-pressed', String(on));
+    row.star.setAttribute('aria-label', `${on ? 'Remove' : 'Add'} ${short(o.maker)} ${on ? 'from' : 'to'} favorites`);
+    if (book.body.children[at] !== row.el) book.body.insertBefore(row.el, book.body.children[at] ?? null);
+  });
+  for (const [maker, row] of book.rows) {
+    if (!seen.has(maker)) {
+      row.el.remove();
+      book.rows.delete(maker);
+    }
+  }
+
+  book.table.hidden = !list.length;
+  book.empty.hidden = !!list.length;
+  if (!list.length) {
+    const hidden = liveOffers(direction).length;
+    // Offers take a moment to arrive, so don't say there are none until they have had time to.
+    const looking = !hidden && (!relays?.connected() || Date.now() - pageStarted < LOOK_FOR_OFFERS_MS);
+    book.empty.classList.toggle('spin', looking);
+    setText(book.empty, hidden
+      ? `No maker you chose to see is offering this direction right now. ${hidden} hidden by the switches below.`
+      : looking ? (relays?.connected() ? 'Looking for makers…' : 'Connecting to Nostr relays…') : 'No maker is offering this direction right now.');
+  }
+  book.onlyVetted.checked = onlyVetted();
+  book.onlyFavorites.checked = !!settings.onlyFavorites;
+  book.warning.hidden = onlyVetted();
+}
+
+// ---- Wallet ----
+// With a wallet in this browser, the main button connects it. A wallet on a phone is then one more button away: WalletConnect's
+// QR code. A phone gets its own list of wallets instead, since it can't scan its own screen.
+const offerQr = () => !wallet && extensionWallets().length > 0 && !matchMedia('(pointer: coarse)').matches;
+
+async function qrConnect() {
+  if (connecting) return;
+  connecting = true;
+  try {
+    useWallet(await walletConnect(), { kind: 'walletconnect' });
+  } catch (e) {
+    fail(e);
+  } finally {
+    connecting = false;
+  }
+}
+
+const qrButton = () => offerQr() && h('button', { class: 'btn quiet walletconnect-qr', type: 'button', onclick: () => qrConnect() }, 'Or connect a phone wallet with a QR code');
+
+function walletView() {
+  if (wallet) {
+    refreshWalletUsdt();
+    return h('p', { class: 'note' }, `Polygon: ${wallet.name} ${short(wallet.address)}`, h('span', { class: 'wallet-balances' }, balancesText()), ' ',
+      h('a', { href: '#', onclick: (e) => { e.preventDefault(); wallet = null; rememberWallet(null); render(); } }, 'disconnect'));
+  }
+  return [h('button', { class: 'btn quiet connect-wallet', onclick: connectWallet }, 'Connect a Polygon wallet'), qrButton()];
+}
+
+// A wallet saying no is the person's answer, so it isn't a reason to open another one.
+const refusedByUser = (e) => e?.code === 4001 || /reject|denied|declin|cancel/i.test(e?.message ?? '');
+
+// While a wallet has a transaction to approve, the page says so plainly and stays on top: an approval waits in the wallet's own
+// window or app, and with WalletConnect on another device, where it is easy to miss.
+function watched(w, phone) {
+  return {
+    ...w,
+    send: async (call) => {
+      // A wallet that never answers would hold this swap's steps for ever, its checks included. An EVM wallet sends what it is
+      // asked to itself, so after stopping, approving in the wallet still sends it. The page reads the chain, and carries on.
+      let stop;
+      const stopped = new Promise((_, reject) => { stop = () => reject(new Error(`Stopped waiting for ${w.name}. If you approve it there later, it is still sent, and this page will see it.`)); });
+      const note = h('div', { id: 'wallet-wait', role: 'alertdialog', 'aria-live': 'assertive' },
+        h('div', { class: 'spinner' }),
+        h('strong', {}, `Approve in ${w.name}`),
+        h('p', {}, phone
+          ? `The request is waiting in ${w.name} on your phone. Open the app to approve it. Nothing happens on this page until you do.`
+          : `${w.name} has a transaction for you to approve, in its own window. If you don't see it, open ${w.name} from the browser's toolbar.`),
+        h('button', { class: 'btn quiet', id: 'wallet-stop', onclick: () => stop() }, 'Stop waiting'));
+      document.body.append(note);
+      try {
+        return await Promise.race([w.send(call), stopped]);
+      } finally {
+        note.remove();
+      }
+    },
+  };
+}
+
+function useWallet(got, remember) {
+  wallet = watched(got, remember?.kind === 'walletconnect');
+  rememberWallet(remember);
+  render();
+}
+
+// Wallets in this browser. If none is here or none will connect, WalletConnect's code, which a phone also gets as a link.
+let connecting = false;
+
+async function connectWallet() {
+  if (connecting) return;
+  connecting = true;
+  try {
+    for (const w of extensionWallets()) {
+      try {
+        useWallet(await connectExtension(w), { kind: 'extension', name: w.name });
+        return;
+      } catch (e) {
+        console.warn('wallet connect', w.name, e?.message ?? e);
+        if (refusedByUser(e)) {
+          fail(new Error(`${w.name} declined the connection.`));
+          return;
+        }
+      }
+    }
+    useWallet(await walletConnect(), { kind: 'walletconnect' });
+  } catch (e) {
+    fail(e);
+  } finally {
+    connecting = false;
+  }
+}
+
+function rememberWallet(which) {
+  settings.lastWallet = which;
+  saveSettings(settings);
+}
+
+// Reconnect the wallet used last time, without a prompt, so reloading mid-swap doesn't ask again. If it doesn't trust this page any
+// more, the buttons are still there. A wallet only ever signs when the taker presses something.
+async function restoreWallet() {
+  const last = settings.lastWallet;
+  if (!last) return;
+  try {
+    let got = null;
+    if (last.kind === 'walletconnect') {
+      got = await restoreWalletConnect(settings.walletConnectProject || NETWORK.walletConnectProject);
+    } else {
+      // Extensions can register a little after the page loads.
+      for (let tries = 0; tries < 30 && !got; tries++) {
+        const w = extensionWallets().find((x) => x.name === last.name);
+        if (w) got = await connectExtension(w, true);
+        else await new Promise((r) => setTimeout(r, 100));
+      }
+    }
+    if (got && !wallet) {
+      wallet = watched(got, last.kind === 'walletconnect');
+      render();
+    }
+  } catch (e) {
+    console.warn('reconnecting the wallet', e?.message ?? e);
+  }
+}
+
+async function walletConnect() {
+  // Open at once: the library is large and the relay takes a few seconds, so the code comes later.
+  const title = h('h3', {}, 'Connecting to WalletConnect…');
+  const box = h('div', { class: 'qr-wait', role: 'status', 'aria-label': 'Connecting to WalletConnect' }, h('div', { class: 'spinner' }));
+  const dialog = h('dialog', {}, title, box,
+    h('button', { class: 'btn quiet', onclick: () => dialog.close() }, 'Close'));
+  document.body.append(dialog);
+  dialog.showModal();
+  // Closing the dialog ends this attempt. Otherwise it waited on for the phone, and every connect button, waiting for it,
+  // did nothing until a reload. A phone that approves afterwards is ignored.
+  const closed = new Promise((_, reject) => {
+    dialog.addEventListener('close', () => reject(Object.assign(new Error('closed'), { closedByUser: true })), { once: true });
+  });
+  try {
+    const { qrcode } = await import('../vendor/qrcode.js');
+    return await Promise.race([closed, connectWalletConnect(settings.walletConnectProject || NETWORK.walletConnectProject, (uri) => {
+      const qr = qrcode(0, 'L');
+      qr.addData(uri);
+      qr.make();
+      title.textContent = 'Scan with your wallet';
+      box.className = 'qr';
+      box.removeAttribute('role');
+      box.removeAttribute('aria-label');
+      box.innerHTML = qr.createSvgTag({ cellSize: 3, margin: 2, scalable: true });
+      markEnlargeable(box);
+      // The same request for a wallet on this device, which can't scan its own screen.
+      if (matchMedia('(pointer: coarse)').matches) {
+        box.after(
+          h('a', { class: 'btn quiet open-wc', href: uri }, 'Open in a wallet on this phone'),
+          h('p', { class: 'note' }, 'Your phone only lists wallets that handle these links. If yours isn’t there, close this and open the page in the wallet’s own browser.'),
+        );
+      }
+    })]);
+  } finally {
+    dialog.close();
+    dialog.remove();
+  }
+}
+
+// ---- Starting a swap ----
+// These two stay the same elements across updates. New offers arrive every few seconds, and rebuilding an input could lose what
+// was being typed into it at that moment.
+const amountInput = h('input', {
+  class: 'amount', inputMode: 'decimal', placeholder: '0', id: 'amount',
+  oninput: (e) => { ui.amount = e.target.value; updateForm(); },
+});
+// Empties the amount, and shows only when there's something to empty.
+const clearAmount = h('button', {
+  class: 'clear-amount', id: 'clear-amount', type: 'button', title: 'Clear the amount', 'aria-label': 'Clear the amount', hidden: true,
+  onclick: () => {
+    ui.amount = '';
+    amountInput.value = '';
+    updateForm();
+    amountInput.focus();
+  },
+}, '×');
+const toInput = h('input', {
+  class: 'input', id: 'to', placeholder: NETWORK.addressHint,
+  oninput: (e) => { ui.to = e.target.value; updateForm(); },
+});
+
+// A plain down arrow, as swapmarket.github.io's direction button has.
+function arrowDown() {
+  const NS = 'http://www.w3.org/2000/svg';
+  const svg = document.createElementNS(NS, 'svg');
+  svg.setAttribute('viewBox', '0 0 16 16');
+  svg.setAttribute('width', '14');
+  svg.setAttribute('height', '14');
+  svg.setAttribute('aria-hidden', 'true');
+  const path = document.createElementNS(NS, 'path');
+  path.setAttribute('d', 'M8 15.5 15.5 8H11V.5H5V8H.5z');
+  path.setAttribute('fill', 'currentColor');
+  svg.append(path);
+  return svg;
+}
+
+// The form stays on the page too, and updateForm changes only what differs.
+const form = {
+  receive: h('input', { class: 'amount', readOnly: true, placeholder: '0' }),
+  fromCoin: h('span', { class: 'slot' }),
+  toCoin: h('span', { class: 'slot' }),
+  address: h('div'),
+  wallet: h('div'),
+  facts: h('div'),
+  unfilled: h('div'),
+  go: h('button', { class: 'btn', id: 'go', onclick: () => (wallet ? startQuote() : connectWallet()) }),
+  qr: h('button', { class: 'btn quiet walletconnect-qr', type: 'button', hidden: true, onclick: () => qrConnect() }, 'Or connect a phone wallet with a QR code'),
+  limits: null,
+  sendMin: h('button', { class: 'send-limit', id: 'send-min', type: 'button', onclick: () => { if (form.limits) setAmount(form.limits.min); } }),
+  sendMax: h('button', { class: 'send-limit', id: 'send-max', type: 'button', onclick: () => { if (form.limits) setAmount(form.limits.max); } }),
+};
+form.links = h('div', { class: 'send-links' },
+  h('span', {}, 'Send Min:'), form.sendMin,
+  h('span', {}, 'Max:'), form.sendMax);
+// Settings opens over whatever is showing, from the gear on the swap form or on a swap's card.
+const gear = () => h('button', { class: 'gear', type: 'button', title: 'Settings', 'aria-label': 'Settings', onclick: () => settingsDialog() }, '⚙');
+
+form.el = h('div', { class: 'card' },
+  gear(),
+  h('h2', {}, 'Create Atomic Swap'),
+  h('p', { class: 'sub' }, 'Trustless and confidential. No server holds anything.'),
+  form.links,
+  h('div', { class: 'row' }, form.fromCoin, amountInput, clearAmount),
+  h('button', { class: 'flip', title: 'Swap direction', 'aria-label': 'Swap direction', onclick: () => { ui.direction = ui.direction === 'L2P' ? 'P2L' : 'L2P'; ui.selected = null; updateForm(); } }, arrowDown()),
+  h('div', { class: 'row to' }, form.toCoin, form.receive),
+  form.address, form.wallet, form.facts, form.unfilled, form.go, form.qr);
+
+function updateForm() {
+  if (!form.el.isConnected) return;
+  const send = units(ui.amount);
+  const [from, to] = names[ui.direction];
+  const plan = currentPlan(send);
+  const hasAmount = send && send > 0n;
+  const filled = hasAmount && plan.fills.length > 0;
+  const needsAddress = ui.direction === 'P2L';
+  const toProblem = needsAddress && ui.to.trim() ? W.address_problem(ui.to) : '';
+  const ready = !wallet || (filled && (!needsAddress || (ui.to.trim() && !toProblem)));
+  const label = !wallet ? 'Connect a Polygon wallet' : !hasAmount ? 'Enter an amount' : !plan.fills.length ? 'No maker fits this amount' : needsAddress && !ui.to.trim() ? 'Enter a Liquid address' : toProblem ? toProblem.replace(/\.$/, '') : plan.fills.length > 1 ? `Get ${plan.fills.length} firm quotes` : 'Get a firm quote';
+
+  clearAmount.hidden = !ui.amount;
+  amountInput.setAttribute('aria-label', `You send, in ${from}`);
+  form.receive.setAttribute('aria-label', `You receive, in ${to}`);
+  const received = filled ? show(plan.receive) : '';
+  if (form.receive.value !== received) form.receive.value = received;
+  slot(form.fromCoin, from, () => coinPill(from));
+  slot(form.toCoin, to, () => coinPill(to));
+  slot(form.address, String(needsAddress), () => needsAddress && h('label', { class: 'field' }, h('span', {}, 'Your Liquid address, confidential'), toInput));
+  // The main button connects, so the form only needs this once there is a wallet to show.
+  slot(form.wallet, `${wallet?.name}|${wallet?.address}`, () => wallet && walletView());
+  const filledBy = filled && (plan.fills.length === 1 ? short(plan.fills[0].maker) : `${plan.fills.length} separate swaps`);
+  const average = filled && effectivePrice(plan.fills).toFixed(4);
+  slot(form.facts, `${filledBy}|${average}`, () => filled && h('dl', { class: 'facts' },
+    h('div', {}, h('dt', {}, 'Filled by'), h('dd', {}, filledBy)),
+    h('div', {}, h('dt', {}, 'Average price'), h('dd', {}, average))));
+  const partial = filled && plan.unfilled > 0n;
+  slot(form.unfilled, partial ? `${send}|${plan.unfilled}` : '', () => partial && h('p', { class: 'warn', id: 'unfilled' }, `The book can fill ${show(send - plan.unfilled)} of this right now. ${show(plan.unfilled)} would stay unswapped.`));
+  refreshWalletUsdt();
+  form.limits = currentLimits();
+  form.links.hidden = !form.limits;
+  if (form.limits) {
+    setText(form.sendMin, limitText(form.limits.min), 'The smallest order the makers shown below can fill');
+    setText(form.sendMax, limitText(form.limits.max), form.limits.capped
+      ? `All the ${NETWORK.tokenName} this wallet holds. The makers shown below could fill more.`
+      : ui.direction === 'P2L' && wallet ? 'The largest order the makers shown below can fill. This wallet holds at least that.'
+        : ui.direction === 'P2L' ? 'The largest order the makers shown below can fill. Connect a wallet to cap it at what you hold.'
+          : 'The largest order the makers shown below can fill. It doesn\'t check your Liquid balance.');
+  }
+  setText(form.go, label);
+  form.go.disabled = !ready;
+  form.qr.hidden = !offerQr();
+  updateBook(send);
+}
+
+
+function waitFor(n, pred, ms, what) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`The maker did not answer in time, while asking for ${what}. Nothing has been sent, so you can try again.`)), ms);
+    n.onMessage = (got) => {
+      if (got.sender !== n.maker || got.id !== n.id) return;
+      if (got.body.type === 'rfq-reject') {
+        clearTimeout(timer);
+        reject(new Error(`The maker declined: ${String(got.body.body.reason).slice(0, 200)}`));
+      } else if (pred(got)) {
+        clearTimeout(timer);
+        resolve(got);
+      }
+    };
+  });
+}
+
+function sendTo(n, type, body) {
+  const wrapped = JSON.parse(W.wrap_message(n.nostr.secret, n.maker, n.id, NETWORK.name, JSON.stringify({ type, body }), BigInt(now())));
+  relays.publish(wrapped.event);
+  return wrapped.rumor_id;
+}
+
+const spreadLimit = () => rulesJson(settings.maxSpreadBps ?? NETWORK.maxSpreadBps);
+
+async function quoteFill(fill, direction) {
+  const nostr = JSON.parse(W.new_nostr_key());
+  const n = { id: JSON.parse(W.new_nostr_key()).secret, nostr, maker: fill.maker, offer: offers.get(fill.maker), onMessage: () => {} };
+  negotiations.set(nostr.public, n);
+  relays.subscribe(`talk-${nostr.public.slice(0, 12)}`, { kinds: [WRAP_KIND], '#p': [nostr.public], since: now() - 300 });
+  await new Promise((r) => setTimeout(r, 300));
+  const [from, to] = CHAINS[direction];
+  const request = { from, to, amount_side: 'send', amount: fill.send.toString() };
+  const answered = waitFor(n, (g) => g.body.type === 'rfq-quote', 30000, 'a price');
+  sendTo(n, 'rfq-request', request);
+  const got = await answered;
+  const problem = W.quote_problem(spreadLimit(), JSON.stringify(request), JSON.stringify(got.body.body), BigInt(now()));
+  if (problem) throw new Error(`This quote isn't acceptable: ${problem}.`);
+  return { n, quote: got.body.body, rumor: got.rumor_id };
+}
+
+function clearQuote() {
+  ui.quote = null;
+  negotiations.clear();
+}
+
+async function startQuote() {
+  const send = units(ui.amount);
+  const plan = currentPlan(send);
+  const direction = ui.direction;
+  try {
+    // L→P needs no POL up front when the maker's lock forwards some for the claim. That is checked once the quotes are in.
+    if (direction === 'P2L') {
+      const needed = send - plan.unfilled;
+      const holds = await polygon.tokenBalance(NETWORK.token, wallet.address);
+      if (holds < needed) throw new Error(`This wallet holds ${show(holds)} ${NETWORK.tokenName}, and this order needs ${show(needed)}. Nothing has been sent.`);
+      if (await polygon.balance(wallet.address) < NETWORK.minPolWei * BigInt(plan.fills.length)) {
+        throw new Error('This wallet needs a little POL to pay for each lock, or a swap could not start. Nothing has been sent.');
+      }
+    }
+    ui.quote = { status: plan.fills.length > 1 ? `Asking ${plan.fills.length} times for a firm price…` : 'Asking the maker for a firm price…' };
+    render();
+    const settled = await Promise.allSettled(plan.fills.map((f) => quoteFill(f, direction)));
+    const fills = settled.filter((r) => r.status === 'fulfilled').map((r) => r.value);
+    const refused = settled.filter((r) => r.status === 'rejected');
+    if (!fills.length) throw refused[0].reason;
+    ui.quote = { fills, refused: refused.map((r) => r.reason.message), direction, to: ui.to.trim(), owner: wallet.address, wanted: send };
+    render();
+  } catch (e) {
+    clearQuote();
+    render();
+    fail(e);
+  }
+}
+
+// The first of the quotes to expire. A maker refuses an accept after it.
+const quoteUntil = (q) => Math.min(...q.fills.map((f) => f.quote.quote_expiry));
+
+function quoteView() {
+  const q = ui.quote;
+  if (q.status) return h('div', { class: 'card' }, h('h2', {}, 'Getting a quote'), h('p', { class: 'status spin' }, q.status));
+  const [from, to] = names[q.direction];
+  const sum = (key) => q.fills.reduce((total, f) => total + BigInt(f.quote[key]), 0n);
+  const until = quoteUntil(q);
+  const left = Math.max(0, until - now());
+  const many = q.fills.length > 1;
+  return h('div', { class: 'card' },
+    h('h2', {}, many ? `Review ${q.fills.length} quotes` : 'Review the quote'),
+    h('dl', { class: 'facts' },
+      h('div', {}, h('dt', {}, 'You send'), h('dd', {}, `${show(sum('send'))} ${from}`)),
+      h('div', {}, h('dt', {}, 'You receive'), h('dd', {}, `${show(sum('receive'))} ${to}`)),
+      many ? q.fills.map((f) => h('div', {}, h('dt', { class: 'mono' }, short(f.n.maker)), h('dd', {}, `${show(f.quote.send)} → ${show(f.quote.receive)}`)))
+        : h('div', {}, h('dt', {}, 'Maker'), h('dd', { class: 'mono' }, short(q.fills[0].n.maker))),
+      q.direction === 'L2P' && sum('gas_drop') > 0n && h('div', {}, h('dt', {}, 'POL for your claim'), h('dd', { id: 'gas-drop' }, `${pol(sum('gas_drop'))}, sent by the maker`)),
+      h('div', {}, h('dt', {}, 'If a maker never locks'), h('dd', {}, 'Refund after about 8 hours')),
+      h('div', {}, h('dt', {}, 'Price holds for'), h('dd', { id: 'quote-left', 'data-until': until }, left ? `${left} s` : 'Expired'))),
+    many && h('p', { class: 'warn', id: 'not-atomic' }, `These are ${q.fills.length} separate swaps. Each one either completes or refunds by itself, so some may complete while others refund. You ${q.direction === 'L2P' ? 'make one exact payment for each' : 'approve one lock for each'}.`),
+    many && q.direction === 'P2L' && h('p', { class: 'note' }, 'All of them pay the same Liquid address, so anyone can see those payments went to one place, though not their amounts.'),
+    q.refused.length > 0 && h('p', { class: 'warn', id: 'quote-refused' }, `${q.refused.length} of the quotes didn't come through, so this fills less than you asked for: ${q.refused[0]}`),
+    q.direction === 'L2P' && h('p', { class: 'note' }, 'You will need a little L-BTC only if a refund is ever needed.'),
+    left ? h('button', { class: 'btn', id: 'accept', onclick: acceptQuotes }, many ? 'Accept all' : 'Accept')
+      : h('button', { class: 'btn', id: 'requote', onclick: () => { clearQuote(); startQuote(); } }, 'Get a new price'),
+    h('button', { class: 'btn quiet', onclick: () => { clearQuote(); render(); } }, 'Cancel'));
+}
+
+async function acceptFill(f, q, order, tip) {
+  const { n } = f;
+  // The claim is sent from this wallet. Without POL from the maker, it needs its own.
+  if (q.direction === 'L2P' && BigInt(f.quote.gas_drop) === 0n && await polygon.balance(q.owner) < NETWORK.minPolWei) {
+    throw new Error('This maker sends no POL for the claim, and this wallet has too little to pay for it, so nothing was sent for that swap.');
+  }
+  const secrets = JSON.parse(W.new_swap_secrets());
+  const answered = waitFor(n, (g) => g.body.type === 'rfq-terms', 30000, 'the final terms');
+  const rumor = sendTo(n, 'rfq-accept', {
+    quote_event: f.rumor, lock_point: secrets.lock_point, taker_key: secrets.taker_key, blinding_key: secrets.blinding_key, taker_polygon: q.owner,
+    // L→P: the maker's lock forwards its POL to the wallet that will send the claim.
+    gas_to: q.direction === 'L2P' ? q.owner : null,
+  });
+  const got = await answered;
+  const terms = got.body.body;
+  const problem = W.terms_problem(spreadLimit(), q.direction, JSON.stringify(f.quote), rumor, JSON.stringify(terms), tip);
+  if (problem) throw new Error(`A maker's terms aren't acceptable, so nothing was sent for that swap: ${problem}.`);
+  // Checked on the agreed terms themselves, whatever the offer and the form allowed.
+  if (overCap(terms)) throw new Error('A maker\'s terms are above this network\'s limit for one swap, so nothing was sent for that swap.');
+  return deriveSwap({
+    id: n.id, order, created_at: now(), direction: q.direction, maker: n.maker, nostr: n.nostr, secrets, terms,
+    fee_coin_sats: n.offer?.offer.chains.liquid.fee_coin_sats, polygon_owner: q.owner, to_address: q.to, state: 'recovery', status: '',
+  });
+}
+
+async function acceptQuotes() {
+  const q = ui.quote;
+  if (!q?.fills || quoteUntil(q) <= now()) return render();
+  const order = JSON.parse(W.new_nostr_key()).secret.slice(0, 16);
+  try {
+    ui.quote = { status: 'Fixing the terms with the maker…' };
+    render();
+    const tip = await esplora[0].tip();
+    const settled = await Promise.allSettled(q.fills.map((f) => acceptFill(f, q, order, tip)));
+    const swaps = settled.filter((r) => r.status === 'fulfilled').map((r) => r.value);
+    const refused = settled.filter((r) => r.status === 'rejected');
+    if (!swaps.length) throw refused[0].reason;
+    for (const s of swaps) {
+      saveSwap(s);
+      watch(s);
+    }
+    clearQuote();
+    ui.openOrder = order;
+    render();
+    if (refused.length) fail(new Error(`${refused.length} of the swaps didn't start: ${refused[0].reason.message} The others go ahead, and nothing was sent for those.`));
+  } catch (e) {
+    clearQuote();
+    render();
+    fail(e);
+  }
+}
+
+// ---- A swap under way ----
+const FLOW = {
+  L2P: [['recovery', 'Save the recovery file'], ['fund', 'Pay the swap address'], ['confirming', 'Your payment confirms'], ['await_maker', 'The maker locks on Polygon'], ['ready_claim', 'You claim on Polygon'], ['done', 'Done']],
+  P2L: [['recovery', 'Save the recovery file'], ['lock', 'You lock on Polygon'], ['await_maker', 'The maker locks on Liquid'], ['maker_confirms', 'The maker\'s lock confirms'], ['signing', 'Sign the claim together'], ['claiming', 'Publish the claim'], ['done', 'Done']],
+};
+
+// "45s", "3m 05s", "1h 02m".
+function duration(secs) {
+  const t = Math.max(0, Math.floor(secs));
+  if (t < 60) return `${t}s`;
+  if (t < 3600) return `${Math.floor(t / 60)}m ${String(t % 60).padStart(2, '0')}s`;
+  return `${Math.floor(t / 3600)}h ${String(Math.floor((t % 3600) / 60)).padStart(2, '0')}m`;
+}
+
+function stepsView(s) {
+  const flow = FLOW[s.direction];
+  let at = flow.findIndex(([k]) => k === phase(s));
+  // A refund leaves this path, and a list with nothing marked would only confuse.
+  if (at < 0 && s.state !== 'done') return null;
+  const began = (k) => s.step_at?.[k] ?? (k === 'recovery' ? s.created_at : undefined);
+  return h('ol', { class: 'steps' }, flow.map(([k, text], i) => {
+    const done = i < at || s.state === 'done';
+    const start = began(k);
+    // A finished step shows how long it took, and the current one counts up, by itself, between redraws.
+    const next = flow.slice(i + 1).map(([n]) => began(n)).find((t) => t !== undefined);
+    let time = null;
+    if (k !== 'done' && start !== undefined) {
+      if (done && next !== undefined) time = h('span', { class: 'step-time' }, duration(next - start));
+      else if (i === at) time = h('span', { class: 'step-time live', 'data-since': String(start) }, duration(now() - start));
+    }
+    return h('li', { class: done ? 'done' : i === at ? 'now' : '' }, text, time);
+  }));
+}
+
+// Every address of a swap still under way, each linked to its explorer, so a person can watch the chains themselves.
+function addressesView(s) {
+  const liquid = (a) => { try { return W.plain_address(a); } catch { return a; } };
+  const rows = [
+    ['Swap address', s.info?.plain_address, (a) => `${NETWORK.explorer}/address/${a}`],
+    ['Polygon escrow', NETWORK.escrow, (a) => NETWORK.polygonExplorer('address', a)],
+    ['Your Polygon wallet', s.polygon_owner, (a) => NETWORK.polygonExplorer('address', a)],
+    ['Your Liquid address', s.to_address && liquid(s.to_address), (a) => `${NETWORK.explorer}/address/${a}`],
+    ["The maker's Polygon wallet", s.terms.maker_polygon, (a) => NETWORK.polygonExplorer('address', a)],
+  ].filter(([, a]) => a);
+  return h('dl', { class: 'facts addresses' }, rows.map(([label, a, url]) => h('div', {},
+    h('dt', {}, label),
+    h('dd', {}, h('a', { class: 'explorer mono', href: url(a), target: '_blank', rel: 'noopener noreferrer', title: a }, `${a.slice(0, 8)}…${a.slice(-6)}`)))));
+}
+
+// One file for a whole order, and nothing is funded until it has been read back with every swap in it.
+// A box to paste recovery text into, for a browser that can't save or pick files, like a wallet's.
+function pasteBox(id, label, onText) {
+  const text = h('textarea', { class: 'input recovery-paste', id, rows: 3, spellcheck: false, autocomplete: 'off', placeholder: '{ "format": "liq2any-recovery", … }' });
+  return h('div', { class: 'paste-box' },
+    h('label', { class: 'field' }, h('span', {}, label), text),
+    h('button', {
+      class: 'btn quiet',
+      id: `${id}-go`,
+      onclick: async () => {
+        try {
+          await onText(text.value);
+        } catch (err) {
+          fail(err);
+        }
+      },
+    }, 'Use this text'));
+}
+
+// Each order's recovery codes, once shown.
+const shownCodes = new Map();
+
+// A phone: its browser may offer only the camera and photos for a file, so recovery can go through pictures too.
+const onPhone = () => matchMedia('(pointer: coarse)').matches;
+
+// A QR code drawn in the screen's own pixels, each square a whole number of them, with the 4-square white border readers need. A
+// screenshot of it is then exact on any phone; a scaled image or SVG blurred the squares' edges, and readers gave up.
+function codeCanvas(qr, label) {
+  const squares = qr.getModuleCount() + 8;
+  const dpr = window.devicePixelRatio || 1;
+  const wanted = Math.min(480, document.documentElement.clientWidth - 64) * dpr;
+  const unit = Math.max(2, Math.floor(wanted / squares));
+  const canvas = h('canvas', { role: 'img', 'aria-label': label });
+  canvas.width = canvas.height = unit * squares;
+  canvas.style.width = canvas.style.height = `${(unit * squares) / dpr}px`;
+  const g = canvas.getContext('2d');
+  g.fillStyle = '#fff';
+  g.fillRect(0, 0, canvas.width, canvas.height);
+  g.fillStyle = '#000';
+  for (let r = 0; r < squares - 8; r++) for (let c = 0; c < squares - 8; c++) if (qr.isDark(r, c)) g.fillRect((c + 4) * unit, (r + 4) * unit, unit, unit);
+  return canvas;
+}
+
+// The recovery as QR codes, one per swap, to keep as screenshots. Their bytes go in as they are, not as text.
+async function recoveryCodesView(swaps) {
+  const { qrcode } = await import('../vendor/qrcode.js');
+  const codes = await recoveryCodes(swaps);
+  const usual = qrcode.stringToBytes;
+  try {
+    qrcode.stringToBytes = (s) => Array.from(s, (c) => c.charCodeAt(0));
+    return codes.map((bytes, i) => {
+      // jsQR, which reads them back, can't decode version 23 (109 squares a side), while it reads every other version: version 24
+      // instead. Measured over versions 15 to 40; phone scanners read 23 fine.
+      const make = (version) => {
+        const qr = qrcode(version, 'L');
+        qr.addData(String.fromCharCode(...bytes), 'Byte');
+        qr.make();
+        return qr;
+      };
+      let qr = make(0);
+      if (qr.getModuleCount() === 4 * 23 + 17) qr = make(24);
+      const box = markEnlargeable(h('div', { class: 'recovery-code' }, codeCanvas(qr, `Recovery QR code${codes.length > 1 ? ` ${i + 1} of ${codes.length}` : ''}`)), swapLines(swaps[i]));
+      return h('figure', {}, box, codes.length > 1 && h('figcaption', {}, `Swap ${i + 1} of ${codes.length}`));
+    });
+  } finally {
+    qrcode.stringToBytes = usual;
+  }
+}
+
+function recoveryView(swaps) {
+  const accept = async (text) => acceptSwaps(await readRecovery(text));
+  const acceptSwaps = async (read) => {
+    const has = (s) => read.some((r) => r.id === s.id && r.secrets.lock_secret === s.secrets.lock_secret);
+    if (!swaps.every(has)) throw new Error('That recovery file is for a different swap.');
+    await Promise.all(swaps.map((s) => withSwap(s.id, (fresh) => engine.set(fresh, { state: fresh.direction === 'L2P' ? 'fund' : 'lock', recovery_saved: true }))));
+    // render() leaves the page alone while a file picker or text box has focus, and using one leaves it there.
+    document.activeElement?.blur();
+    render();
+  };
+  const pick = h('input', {
+    type: 'file', accept: '.json,application/json,image/*', multiple: true, class: 'input', id: 'recovery-file',
+    onchange: async (e) => {
+      try {
+        await acceptSwaps(await readRecoveryFiles([...e.target.files]));
+      } catch (err) {
+        fail(err);
+      }
+    },
+  });
+  const codes = h('div', { class: 'recovery-codes', hidden: true });
+  const orderKey = swaps[0].order ?? swaps[0].id;
+  const showCodes = async (full = true) => {
+    try {
+      if (!shownCodes.has(orderKey)) shownCodes.set(orderKey, await recoveryCodesView(swaps));
+      codes.replaceChildren(
+        h('p', { class: 'note' }, swaps.length > 1
+          ? `Take a screenshot of each of these ${swaps.length} codes, then choose them all below, to confirm they read back.`
+          : 'Take a screenshot of this code, then choose it below, to confirm it reads back.'),
+        h('p', { class: 'warn' }, 'A screenshot can move your funds, like the file. Phones often back up photos to the cloud, so keep it out of shared albums, and delete it once the swap is done.'),
+        ...shownCodes.get(orderKey));
+      codes.hidden = false;
+      // Straight to full screen, ready to screenshot, one code at a time.
+      const boxes = [...codes.querySelectorAll('.recovery-code')];
+      if (full && boxes.length) enlarge(boxes[0], boxes.slice(1));
+    } catch (err) {
+      fail(err);
+    }
+  };
+  // Shown once, they stay shown when the card is drawn again, without being made again, and without opening full screen again.
+  if (shownCodes.has(orderKey)) showCodes(false);
+  // Shown only if the browser won't let the page copy, so the text can be selected by hand.
+  const shown = h('textarea', { class: 'input recovery-paste', id: 'recovery-text', rows: 4, readOnly: true, spellcheck: false });
+  const shownBox = h('div', { hidden: true }, h('p', { class: 'note' }, 'This browser won’t let the page copy. Select all of this text, and copy it yourself:'), shown);
+  const copy = async () => {
+    const text = await makeRecovery(swaps);
+    shown.value = text;
+    try {
+      await navigator.clipboard.writeText(text);
+      toast('Recovery text copied. Save it now.');
+    } catch {
+      shownBox.hidden = false;
+      shown.focus();
+      shown.select();
+    }
+  };
+  return h('div', { class: 'card', id: 'recovery-card' },
+    h('h2', {}, 'Save your recovery file'),
+    h('p', { class: 'warn' }, 'This file can move your funds, so treat it like money. It is the only way back if this browser loses its data. Never share it: no maker or support person ever needs it.'),
+    h('button', { class: 'btn', id: 'download', onclick: async () => offerDownload(await makeRecovery(swaps), `liq2sol-recovery-${swaps[0].order ?? swaps[0].id.slice(0, 8)}.json`) }, swaps.length > 1 ? `Download the recovery file for all ${swaps.length} swaps` : 'Download recovery file'),
+    onPhone() && h('button', { class: 'btn quiet', id: 'show-codes', onclick: () => showCodes() }, swaps.length > 1 ? 'Or save it as pictures: show QR codes' : 'Or save it as a picture: show a QR code'),
+    codes,
+    h('label', { class: 'field' }, h('span', {}, onPhone()
+      ? 'Then choose the file, or the screenshots, to confirm they are intact. The next step stays hidden until you do.'
+      : 'Then choose the file you saved, to confirm it is intact. The next step stays hidden until you do.'), pick),
+    h('h4', {}, 'Can’t download? A wallet’s browser usually can’t.'),
+    h('p', { class: 'note' }, 'Copy the same thing as text, and save it somewhere private, such as a password manager. Other apps can sometimes read what you copy, so clear it from your clipboard afterwards.'),
+    h('button', { class: 'btn quiet', id: 'copy-recovery', onclick: copy }, 'Copy it as text'),
+    shownBox,
+    pasteBox('recovery-paste', 'Then paste what you saved, to confirm it is intact.', accept));
+}
+
+function toast(text) {
+  let el = $('toast');
+  if (!el) {
+    el = h('div', { id: 'toast', role: 'status', 'aria-live': 'polite' });
+    document.body.append(el);
+  }
+  el.textContent = text;
+  el.hidden = false;
+  clearTimeout(toast.timer);
+  toast.timer = setTimeout(() => { el.hidden = true; }, 2500);
+}
+
+// A long address may only break between groups of 8, with invisible break points, so the last line is never a lone character, and
+// selecting or copying it gives the address unchanged.
+function addressText(text) {
+  if (text.length < 24 || /\s/.test(text)) return [text];
+  const groups = text.match(/.{1,8}/g);
+  // A short remainder joins the group before it.
+  if (groups.at(-1).length < 4) {
+    const last = groups.pop();
+    groups[groups.length - 1] += last;
+  }
+  const parts = [];
+  for (const g of groups) parts.push(g, h('wbr'));
+  parts.pop();
+  return parts;
+}
+
+// A value to pay. It copies just the value, without the asset's name.
+function copyable(cls, shown, value, name) {
+  return h('button', {
+    class: `addr copy ${cls}`,
+    type: 'button',
+    title: `Copy the ${name.toLowerCase()}`,
+    onclick: async () => {
+      try {
+        await navigator.clipboard.writeText(value);
+        toast(`${name} copied`);
+      } catch (e) {
+        fail(new Error(`Could not copy the ${name.toLowerCase()}, so please copy it by hand.`));
+      }
+    },
+  }, addressText(shown));
+}
+
+// Each payment address's QR code, once made, so a redraw shows it at once.
+const qrCache = new Map();
+
+async function qrView(text) {
+  const { qrcode } = await import('../vendor/qrcode.js');
+  const qr = qrcode(0, 'M');
+  qr.addData(text);
+  qr.make();
+  const box = h('div', { class: 'qr' });
+  box.innerHTML = qr.createSvgTag({ cellSize: 3, margin: 2, scalable: true });
+  return markEnlargeable(box);
+}
+
+// Any QR code fills the screen when tapped, in white, as large as fits, for a phone held at a distance or a screenshot. It opens
+// as its own layer, over the dialog if it is in one, so the page redrawing underneath doesn't shrink it. A tap or Escape closes it.
+// What a recovery code's screenshot says above the code, so it can be told apart from others later.
+function swapLines(s) {
+  const [from, to] = names[s.direction];
+  const send = s.direction === 'L2P' ? BigInt(s.terms.liquid_amount) / 100n : BigInt(s.terms.polygon_amount);
+  const receive = s.direction === 'L2P' ? BigInt(s.terms.polygon_amount) : BigInt(s.terms.liquid_amount) / 100n;
+  return [
+    `${from} → ${to} · You send ${show(send)} ${from}, you receive ${show(receive)} ${to}`,
+    `Recovery for swap ${(s.order ?? s.id).slice(0, 8)} · ${new Date(s.created_at * 1000).toLocaleString()}`,
+  ];
+}
+
+function markEnlargeable(box, lines = []) {
+  if (lines.length) box.dataset.details = lines.join('\n');
+  box.dataset.enlarge = '';
+  box.title = 'Tap to enlarge';
+  box.tabIndex = 0;
+  return box;
+}
+
+// One code, or several in turn: a tap shows the next, so each can be screenshotted alone, and the last tap closes. Escape closes.
+function enlarge(box, rest = []) {
+  const all = [box, ...rest];
+  let at = 0;
+  const layer = h('div', { class: 'qr-full', role: 'dialog', tabIndex: 0 });
+  const show = () => {
+    const canvas = all[at].querySelector('canvas');
+    const code = canvas ? h('img', { src: canvas.toDataURL(), alt: '' }) : all[at].querySelector('svg')?.cloneNode(true);
+    const more = all.length > 1 ? `Swap ${at + 1} of ${all.length}${at + 1 < all.length ? ' · tap for the next' : ''}` : '';
+    layer.setAttribute('aria-label', `QR code, enlarged${more ? `, ${more}` : ''}. Tap to ${at + 1 < all.length ? 'see the next' : 'close'}.`);
+    const details = all[at].dataset.details;
+    layer.replaceChildren(...[
+      details && h('div', { class: 'qr-full-details' }, details.split('\n').map((line) => h('p', {}, line))),
+      code,
+      more && h('p', { class: 'qr-full-caption' }, more),
+    ].filter(Boolean));
+  };
+  const close = () => { layer.remove(); box.focus(); };
+  const next = () => {
+    if (at + 1 < all.length) {
+      at += 1;
+      show();
+    } else close();
+  };
+  layer.onclick = next;
+  layer.onkeydown = (e) => {
+    if (['Escape', 'Enter', ' '].includes(e.key)) {
+      // Escape would otherwise also close the dialog underneath.
+      e.preventDefault();
+      e.stopPropagation();
+      if (e.key === 'Escape') close();
+      else next();
+    }
+  };
+  show();
+  (box.closest('dialog') ?? document.body).append(layer);
+  layer.focus();
+}
+
+document.addEventListener('click', (e) => {
+  const box = e.target.closest?.('[data-enlarge]');
+  if (box) enlarge(box);
+});
+document.addEventListener('keydown', (e) => {
+  const box = e.target.closest?.('[data-enlarge]');
+  if (box && (e.key === 'Enter' || e.key === ' ')) {
+    e.preventDefault();
+    enlarge(box);
+  }
+});
+
+// A button's action on one swap, in turn with everything else touching it.
+// A button pressed for a swap, until its step ends. The step can wait behind a check already running for the swap, so the
+// page says at once that it heard the press.
+const pressed = new Map();
+
+function act(id, fn, label) {
+  return async () => {
+    if (label) {
+      if (pressed.has(id)) return;
+      pressed.set(id, label);
+      render();
+    }
+    try {
+      await withSwap(id, fn);
+    } catch (e) {
+      fail(e);
+    } finally {
+      pressed.delete(id);
+    }
+    render();
+    // A claim or lock just sent: look again soon, not at the next poll, so the swap moves on as soon as the chain shows it.
+    if (label) setTimeout(() => tickAll(), 3000);
+  };
+}
+
+// A step's button, or what it is doing once pressed.
+// "1/2 confirmations", counting to the number a step waits for.
+const confirmations = (n, terms) => { const need = confirmationsFor(terms); return `${Math.min(n ?? 0, need)}/${need} confirmation${need === 1 ? '' : 's'}`; };
+
+function stepButton(s, cls, text, disabled, fn, label) {
+  if (pressed.has(s.id)) return h('p', { class: `status spin pressed` }, pressed.get(s.id));
+  return h('button', { class: `btn ${cls}`, disabled, onclick: act(s.id, fn, label) }, text);
+}
+
+// What was typed for each swap's refund. The page redraws every few seconds, and a new input would otherwise come back empty.
+const refundTo = new Map();
+
+function refundAddressInput(s) {
+  return h('input', {
+    class: 'input refund-to', placeholder: `${NETWORK.addressHint} confidential address`, value: refundTo.get(s.id) ?? '',
+    oninput: (e) => refundTo.set(s.id, e.target.value),
+  });
+}
+
+// Whether each swap's fee coin is confirmed, so a redraw doesn't flash its button off while it looks again.
+const feeReady = new Map();
+const feeText = new Map();
+
+// Whether the fee coin has arrived. The button that needs it stays off until it is confirmed. It looks again by itself,
+// because the page doesn't redraw while the refund address is being typed.
+function feeCoinStatus(s, button) {
+  const line = h('p', { class: `note fee-status${feeReady.get(s.id) ? ' good-text' : ''}`, 'data-live': '' }, feeText.get(s.id) ?? 'Checking for the fee coin…');
+  button.disabled = !feeReady.get(s.id);
+  const check = () => esplora[0].readCoins(s.info.plain_fee_address, s.info.fee_script, s.secrets.blinding_key).then((coins) => {
+    const fee = coins.filter((c) => c.is_lbtc && BigInt(c.amount) >= BigInt(NETWORK.refundFeeCoinSats));
+    const ready = fee.find((c) => c.confirmations >= 1);
+    line.textContent = ready ? `Fee coin received: ${ready.amount} sats, confirmed. Ready.`
+      : fee.length ? `Fee coin seen: ${fee[0].amount} sats. Waiting for a confirmation, about a minute.`
+        : 'No fee coin yet.';
+    line.classList.toggle('good-text', !!ready);
+    feeReady.set(s.id, !!ready);
+    feeText.set(s.id, line.textContent);
+    button.disabled = !ready;
+    return !!ready;
+  }).catch(() => { line.textContent = 'Couldn’t check for the fee coin just now.'; return false; });
+  const again = () => check().then((ready) => {
+    // Until it is ready, or until a redraw replaces this line with a new one that keeps looking.
+    if (!ready) setTimeout(() => { if (line.isConnected) again(); }, 5000);
+  });
+  again();
+  return line;
+}
+
+function feeCoinParts(s, button) {
+  return [
+    h('p', { class: 'note' }, `This needs a fee coin. From a Liquid wallet, send at least ${NETWORK.refundFeeCoinSats} sats (${(NETWORK.refundFeeCoinSats / 1e8).toFixed(8)} L-BTC) to this address, and wait for a confirmation. Aqua won't send less than 100 sats, which works too:`),
+    copyable('fee-address', s.info.fee_address, s.info.fee_address, 'Address'),
+    feeCoinStatus(s, button),
+  ];
+}
+
+const KNOWN_ASSETS = { [NETWORK.lbtc]: { ticker: 'L-BTC', name: 'Liquid Bitcoin', precision: 8 } };
+
+// What the refund sends back, when it isn't the swap's own USDt. The registry's name is the issuer's to choose, so its
+// domain and the asset id go with it.
+// Each swap's note, kept so a redraw shows it at once instead of hiding it while it reads the coin again.
+const refundNotes = new Map();
+
+function refundCoinNote(s) {
+  const known = refundNotes.get(s.id);
+  const line = h('p', { class: 'warn refund-asset', hidden: !known }, known ?? '');
+  const show = (text) => {
+    refundNotes.set(s.id, text);
+    line.textContent = text;
+    line.hidden = !text;
+  };
+  esplora[0].readCoins(s.info.plain_address, s.info.script, s.secrets.blinding_key).then(async (coins) => {
+    // The same coin the refund takes (Engine.refundCoin).
+    const coin = coins.find((c) => c.is_usdt && c.amount === s.terms.liquid_amount) ?? coins[0];
+    if (!coin || (coin.is_usdt && coin.amount === s.terms.liquid_amount)) {
+      show('');
+      return;
+    }
+    const meta = KNOWN_ASSETS[coin.asset] ?? (coin.is_usdt ? { ticker: 'USDt', precision: 8 } : await esplora[0].asset(coin.asset).catch(() => ({})));
+    const precision = Number.isInteger(meta.precision) ? meta.precision : 0;
+    const amount = precision ? (Number(coin.amount) / 10 ** precision).toFixed(precision).replace(/\.?0+$/, '') : coin.amount;
+    const named = meta.ticker || meta.name
+      ? `${amount} ${meta.ticker ?? ''}${meta.name ? ` (${meta.name}${meta.entity?.domain ? `, issued by ${meta.entity.domain}` : ''})` : ''}`
+      : `${amount} units of an unregistered asset`;
+    show(coin.is_usdt
+      ? `This refunds ${named}, not the swap's ${liquidUnits(s.terms.liquid_amount)} L-USDt.`
+      : `This refunds ${named}. Asset ${coin.asset}.`);
+  }).catch(() => {});
+  return line;
+}
+
+function refundLiquidView(s) {
+  const input = refundAddressInput(s);
+  const button = h('button', { class: 'btn refund', onclick: act(s.id, (fresh) => engine.refundOnLiquid(fresh, (refundTo.get(s.id) ?? '').trim())) }, 'Refund');
+  return [
+    refundCoinNote(s),
+    ...feeCoinParts(s, button),
+    h('label', { class: 'field' }, h('span', {}, 'Where to send your refund'), input),
+    button,
+  ];
+}
+
+function earlyRefundView(s) {
+  const input = refundAddressInput(s);
+  const button = h('button', { class: 'btn early-go', onclick: act(s.id, (fresh) => engine.askEarlyRefund(fresh, (refundTo.get(s.id) ?? '').trim())) }, s.maker_cancelled ? 'Get my refund' : 'Ask the maker');
+  return [
+    s.maker_cancelled
+      ? h('p', { class: 'good maker-cancelled' }, 'The maker cancelled, and won’t lock. Your coin can come back now.')
+      : h('p', { class: 'note' }, 'If the maker hasn’t locked, it can agree to refund you now, instead of after the timed refund. If it says no or doesn’t answer, nothing changes.'),
+    refundCoinNote(s),
+    ...feeCoinParts(s, button),
+    h('label', { class: 'field' }, h('span', {}, 'Where to send your refund'), input),
+    button,
+    s.status && h('p', { class: 'note early-status' }, s.status),
+    // Once the maker has cancelled, there is nothing to wait for.
+    !s.maker_cancelled && h('button', { class: 'btn quiet', onclick: act(s.id, (fresh) => engine.set(fresh, { state: engine.waiting(fresh), status: '' })) }, 'Keep waiting for the maker'),
+  ];
+}
+
+function swapBody(s) {
+  const [from, to] = names[s.direction];
+  switch (s.state) {
+    case 'restored':
+      return h('p', { class: 'status spin' }, s.status || 'Checking the chains to see how far this swap got…');
+    case 'fund': {
+      const box = h('div', { 'data-live': '' });
+      if (qrCache.has(s.info.address)) box.append(qrCache.get(s.info.address).cloneNode(true));
+      else qrView(s.info.address).then((qr) => { qrCache.set(s.info.address, qr); box.append(qr.cloneNode(true)); }).catch(() => {});
+      return [
+        h('p', { class: 'note' }, `Send exactly this amount of ${from}, once, from any Liquid wallet:`),
+        copyable('pay-amount', `${liquidUnits(s.terms.liquid_amount)} ${from}`, liquidUnits(s.terms.liquid_amount), 'Amount'),
+        copyable('pay-address', s.info.address, s.info.address, 'Address'),
+        box,
+        s.wrong_coin && h('p', { class: 'warn' }, 'A coin of the wrong asset or amount reached this address. Nobody will act on it. You can ask the maker to refund it now, or get it back by yourself after the lock height.'),
+        s.wrong_coin && h('button', { class: 'btn quiet early-refund', onclick: act(s.id, (fresh) => engine.askCancel(fresh)) }, 'Ask for a refund now'),
+        s.wrong_coin && s.status && h('p', { class: 'note early-status' }, s.status),
+        h('p', { class: 'note' }, 'The amount stays hidden on-chain only if your wallet pays from blinded coins.'),
+        h('p', { class: 'status spin' }, 'Watching for your payment…'),
+      ];
+    }
+    case 'lock':
+      return [
+        h('p', { class: 'note' }, `Lock ${show(s.terms.polygon_amount)} ${from}. The maker then locks ${show(BigInt(s.terms.liquid_amount) / 100n)} ${to} for you.`),
+        walletView(),
+        h('p', { class: 'note' }, `Your wallet asks twice the first time: once to let the escrow take ${NETWORK.tokenName}, then for the lock.`),
+        stepButton(s, 'lock', 'Lock on Polygon', !wallet, (fresh) => engine.lockOnPolygon(fresh), 'Checking before the lock…'),
+        pressed.has(s.id) && s.status && h('p', { class: 'status' }, s.status),
+      ];
+    case 'await_maker':
+      return [
+        s.escrow_problem && h('p', { class: 'warn escrow-problem' }, `The maker locked, but the secret stays hidden: ${s.escrow_problem}. Your funds are safe, and can come back with a refund.`),
+        h('p', { class: 'status spin confirmations' }, s.direction === 'L2P'
+          ? `Your payment has ${confirmations(s.coin?.confirmations, s.terms)}.`
+          : s.maker_locked ? `The maker locked on Liquid: ${confirmations(s.maker_confirmations, s.terms)}.` : 'Locked. Waiting for the maker to lock on Liquid.'),
+        (s.direction === 'L2P' || s.maker_locked) && s.status && h('p', { class: 'note early-status' }, s.status),
+        s.direction === 'L2P' && s.coin && h('button', {
+          class: 'btn quiet early-refund', title: 'If the maker hasn’t locked, it can cancel now, and you get your coin back without waiting. If it says no, nothing changes.',
+          onclick: act(s.id, (fresh) => engine.askCancel(fresh)),
+        }, 'Ask for a refund now'),
+        s.direction === 'P2L' && !s.maker_locked && h('button', {
+          class: 'btn quiet early-refund', title: 'If the maker hasn’t locked, it can give your Polygon lock back now. If it says no, nothing changes.',
+          onclick: act(s.id, (fresh) => engine.askRelease(fresh)),
+        }, 'Ask for a refund now'),
+      ];
+    case 'early_form':
+      return earlyRefundView(s);
+    case 'early_asked':
+    case 'release_asked':
+      return h('p', { class: 'status spin' }, 'Asking the maker to cancel…');
+    case 'early_signing':
+      return h('p', { class: 'status spin' }, 'Asking the maker to sign the refund…');
+    case 'ready_claim': {
+      // With one endpoint, the claim waits for the box. The engine refuses without it too.
+      const consented = () => !!secondPolygon() || !!settings.allowOneEndpoint;
+      // Sent and not yet finalized: no button, or it looks as if the press didn't count. One that hasn't landed in 90 s can be sent
+      // again, which is safe, since its secret is public once sent.
+      const sent = s.claim_hash && now() - (s.claim_sent_at ?? 0) < 90;
+      const claim = sent
+        ? h('p', { class: 'status spin claim-sent' }, 'Claim sent. Waiting for Polygon to finalize it…')
+        : stepButton(s, 'claim', s.claim_hash ? 'Claim on Polygon again' : 'Claim on Polygon', !wallet || !consented(), (fresh) => engine.claimOnPolygon(fresh), 'Checking the lock before the claim…');
+      return [
+        h('p', { class: 'good' }, `The maker locked ${show(s.terms.polygon_amount)} ${to} for you.`),
+        !secondPolygon() && h('label', { class: 'check' },
+          h('input', {
+            type: 'checkbox', class: 'one-endpoint', checked: !!settings.allowOneEndpoint,
+            onchange: (e) => { settings.allowOneEndpoint = e.target.checked; saveSettings(settings); render(); },
+          }),
+          'I accept that with only one Polygon endpoint this page could be fooled into revealing the secret. (Add a second endpoint in Settings to check two.)'),
+        walletView(),
+        claim,
+        s.status && h('p', { class: 'status' }, s.status),
+      ];
+    }
+    case 'signing':
+      return h('p', { class: 'status spin' }, s.status || 'Signing the claim together with the maker…');
+    case 'claiming':
+      return h('p', { class: 'status spin' }, s.status || 'Publishing the claim…');
+    case 'done':
+      return h('p', { class: 'good done' }, s.status || 'Swap complete.');
+    case 'refund_wait':
+      return h('p', { class: 'status spin' }, s.direction === 'L2P'
+        ? `This swap won't finish. Your refund opens at block ${s.terms.lock_height.toLocaleString('en-US')} (now ${(s.tip ?? 0).toLocaleString('en-US')}). Nobody needs to help, and nobody needs your recovery file.`
+        : 'This swap won’t finish. Your refund opens once both of your lock’s Polygon deadlines have passed. Nobody needs to help, and nobody needs your recovery file.');
+    case 'refund':
+      return refundLiquidView(s);
+    case 'refund_ready':
+      return [
+        h('p', { class: 'note' }, 'The deadlines have passed, so your Polygon funds can come back.'),
+        walletView(),
+        h('button', { class: 'btn refund', disabled: !wallet, onclick: act(s.id, (fresh) => engine.refundOnPolygon(fresh)) }, 'Refund on Polygon'),
+      ];
+    case 'refunding':
+      return h('p', { class: 'status spin' }, s.status || 'Refund sent, waiting for a confirmation.');
+    case 'refunded':
+      return [h('p', { class: 'good refunded' }, 'Refunded.'), h('p', { class: 'note refund-links' }, 'See it on: ', explorerLinks(s))];
+    case 'expired':
+      return h('p', { class: 'note' }, 'This swap expired before anything was paid.');
+    case 'cancelled':
+      return h('p', { class: 'note' }, 'You cancelled this swap. If a payment reached it anyway, use Rescue with your recovery file.');
+    default:
+      return h('p', { class: 'status' }, s.status);
+  }
+}
+
+function swapView(s) {
+  const [from, to] = names[s.direction];
+  return h('div', { class: 'card swap-card', 'data-state': s.state, 'data-id': s.id },
+    gear(),
+    h('h2', {}, `${from} → ${to}`),
+    h('dl', { class: 'facts' },
+      h('div', {}, h('dt', {}, 'You send'), h('dd', {}, s.direction === 'L2P' ? `${show(BigInt(s.terms.liquid_amount) / 100n)} ${from}` : `${show(s.terms.polygon_amount)} ${from}`)),
+      h('div', {}, h('dt', {}, 'You receive'), h('dd', {}, s.direction === 'L2P' ? `${show(s.terms.polygon_amount)} ${to}` : `${show(BigInt(s.terms.liquid_amount) / 100n)} ${to}`))),
+    stepsView(s),
+    swapBody(s),
+    !FINISHED.includes(s.state) && tickProblems.has(s.id) && h('p', { class: 'note tick-problem' }, `Can't check this swap right now, so it tries again shortly: ${tickProblems.get(s.id)}`),
+    !FINISHED.includes(s.state) && addressesView(s));
+}
+
+const orderOf = (id) => Object.values(loadSwaps()).filter((s) => (s.order ?? s.id) === id).sort((a, b) => a.id.localeCompare(b.id));
+
+function cancelCard(shown) {
+  // The swaps as they are when the button is pressed: a card that looks the same can stay on screen while they move on.
+  const current = () => shown.map((s) => loadSwaps()[s.id]).filter(Boolean);
+  const cancel = async (dialog) => {
+    dialog?.close();
+    dialog?.remove();
+    const swaps = current();
+    try {
+      // All or none, so no part of an order is dropped while another turns out to be paid.
+      const problems = await Promise.all(swaps.map((s) => engine.cancelProblem(s)));
+      const problem = problems.find(Boolean);
+      if (problem) throw new Error(`This can't be cancelled, because ${problem}.`);
+      await Promise.all(swaps.map((s) => withSwap(s.id, (fresh) => engine.set(fresh, { state: 'cancelled', status: '' }))));
+      // So each maker frees what it held for these swaps now, not at the end of its lock window.
+      for (const s of swaps) engine.tellCancelled(s);
+      ui.openOrder = null;
+      render();
+    } catch (e) {
+      fail(e);
+    }
+  };
+  const ask = () => {
+    const swaps = current();
+    // Until the recovery file is checked, the page hasn't shown where to pay or lock, so there is nothing to warn about.
+    if (swaps.every((s) => s.state === 'recovery')) return cancel(null);
+    const dialog = h('dialog', {},
+      h('h3', {}, swaps.length > 1 ? `Cancel these ${swaps.length} swaps?` : 'Cancel this swap?'),
+      h('p', { class: 'warn' }, 'If you have already sent the payment, don’t cancel. If one arrives afterwards, use Rescue with your recovery file to get it back.'),
+      h('button', { class: 'btn', id: 'cancel-confirm', onclick: () => cancel(dialog) }, 'Cancel the swap'),
+      h('button', { class: 'btn quiet', id: 'cancel-keep', onclick: () => { dialog.close(); dialog.remove(); } }, 'Keep it'));
+    document.body.append(dialog);
+    dialog.showModal();
+  };
+  return h('div', { class: 'card back' }, h('button', { class: 'btn quiet', id: 'cancel-order', onclick: ask }, 'Cancel'));
+}
+
+function orderView(swaps) {
+  const waiting = swaps.filter((s) => s.state === 'recovery');
+  const back = h('div', { class: 'card back' }, h('button', { class: 'btn quiet', id: 'order-back', onclick: () => { ui.openOrder = null; render(); } }, swaps.every((s) => FINISHED.includes(s.state)) ? 'OK' : 'Back'));
+  // Back would leave it open in the history for ever, with nothing to do but wait.
+  const end = swaps.every((s) => CANCELLABLE.includes(s.state)) ? cancelCard(swaps) : back;
+  if (waiting.length) return [recoveryView(waiting), end];
+  const header = swaps.length > 1 && h('p', { class: 'sub order-summary' }, `${swaps.filter((s) => s.state === 'done').length} of ${swaps.length} swaps complete. Each one finishes or refunds by itself.`);
+  return [header, swaps.map(swapView), end];
+}
+
+// ---- Rescue and history ----
+function rescueView() {
+  const restore = async (text) => restoreSwaps(await readRecovery(text));
+  const restoreSwaps = async (swaps) => {
+    const known = loadSwaps();
+    for (const raw of swaps) {
+      ui.openOrder = raw.order ?? raw.id;
+      // This browser's own record knows more than the file, which was saved before the swap began. Unless it was cancelled:
+      // then the file is here because a payment may have arrived after all, so ask the chains. The same goes for an expired one.
+      if (known[raw.id] && !['cancelled', 'expired'].includes(known[raw.id].state)) continue;
+      const s = deriveSwap(raw);
+      s.state = 'restored';
+      saveSwap(s);
+      watch(s);
+    }
+    location.hash = '#swap';
+    document.activeElement?.blur();
+    render();
+  };
+  const pick = h('input', {
+    type: 'file', accept: '.json,application/json,image/*', multiple: true, class: 'input', id: 'rescue-file',
+    onchange: async (e) => {
+      try {
+        await restoreSwaps(await readRecoveryFiles([...e.target.files]));
+      } catch (err) {
+        fail(err);
+      }
+    },
+  });
+  return h('div', { class: 'card' },
+    h('h2', {}, 'Rescue'),
+    h('p', { class: 'sub' }, 'Pick up a swap on any device, with its recovery file. No maker, relay or server is needed for a refund.'),
+    h('label', { class: 'field' }, h('span', {}, 'Your recovery file, or screenshots of its QR codes'), pick),
+    pasteBox('rescue-paste', 'Or paste its text', restore));
+}
+
+// What this swap's agreed amounts come to per unit received. Liquid amounts have two more decimals than Polygon's.
+function swapPrice(s) {
+  const liquid = BigInt(s.terms.liquid_amount);
+  const other = BigInt(s.terms.polygon_amount) * 100n;
+  return effectivePrice([s.direction === 'L2P' ? { send: liquid, receive: other } : { send: other, receive: liquid }]).toFixed(4);
+}
+
+// Links with the swap's blinders in the part of the address a browser doesn't send, so the explorer page shows the amounts.
+// Whoever gets such a link can read them. Filled in afterwards, because the coin's transaction has to be fetched.
+function explorerLinks(s) {
+  const link = (cls, href, text) => h('a', { class: `explorer ${cls}`, href, target: '_blank', rel: 'noopener noreferrer', title: 'Opens the explorer with this swap’s amounts unblinded. Anyone you share this link with can read them.' }, text);
+  // The Polygon side, by the transactions this page sent. A lock is in the escrow's own storage, with no address of its own.
+  const tx = (hash, text) => hash && link('explorer-polygon', NETWORK.polygonExplorer('tx', hash), text);
+  const box = h('span', { class: 'explorer-links', 'data-live': '' },
+    tx(s.lock_hash, 'Polygon lock'), tx(s.claim_hash, 'Polygon claim'), tx(s.refund_hash, 'Polygon refund'));
+  // A refund of a coin this page never read, such as a wrong one, still gets its link, without amounts.
+  if (!s.coin?.txid && s.refund_txid) box.prepend(link('explorer-spend', `${NETWORK.explorer}/tx/${s.refund_txid}`, 'Liquid refund'));
+  if (s.coin?.txid) {
+    const add = (blinded) => {
+      const spend = s.refund_txid ?? s.claim_txid;
+      box.prepend(link('explorer-coin', `${NETWORK.explorer}/tx/${s.coin.txid}${blinded}`, 'Liquid coin'),
+        ...(spend ? [link('explorer-spend', `${NETWORK.explorer}/tx/${spend}${blinded}`, s.refund_txid ? 'Liquid refund' : 'Liquid claim')] : []));
+    };
+    // Fetched once per coin, so the history page redrawing itself doesn't make the links blink.
+    const key = `${s.coin.txid}:${s.coin.vout}`;
+    if (blinderCache.has(key)) add(blinderCache.get(key));
+    else {
+      esplora[0].txHex(s.coin.txid).then((hex) => {
+        const blinded = `#blinded=${W.explorer_blinders(hex, s.coin.vout, s.secrets.blinding_key)}`;
+        blinderCache.set(key, blinded);
+        add(blinded);
+      }).catch((e) => console.warn('explorer link', e?.message ?? e));
+    }
+  }
+  return box;
+}
+const blinderCache = new Map();
+
+// Which history rows are open, so the page refreshing itself doesn't close them.
+const expanded = new Set();
+
+function historyView() {
+  const all = Object.values(loadSwaps()).sort((a, b) => b.created_at - a.created_at);
+  if (!all.length) return h('div', { class: 'card' }, h('h2', {}, 'History'), h('p', { class: 'sub' }, 'Swaps from this browser appear here.'));
+  const fact = (name, value) => h('div', {}, h('dt', {}, name), h('dd', {}, value));
+  const items = all.map((s) => {
+    const [from, to] = names[s.direction];
+    const vetted = vettedMaker(NETWORK.name, s.maker);
+    const details = h('dl', { class: 'facts history-details', hidden: !expanded.has(s.id) },
+      fact('Created', new Date(s.created_at * 1000).toLocaleString()),
+      fact('Price', h('span', { class: 'history-price', title: `${from} paid for each ${to} received` }, swapPrice(s))),
+      fact('Maker', h('span', { class: 'mono history-maker', title: s.maker }, short(s.maker),
+        vetted && h('span', { class: 'vetted', title: 'Vetted by SwapMarket', 'aria-label': 'Vetted by SwapMarket' }, ' ✓'))),
+      fact('Explorers', explorerLinks(s)),
+      h('div', { class: 'history-actions' },
+        h('button', { class: 'btn quiet', onclick: () => { ui.openOrder = s.order ?? s.id; location.hash = '#swap'; render(); } }, 'Open'),
+        FINISHED.includes(s.state) && h('button', { class: 'btn quiet', onclick: () => { removeSwap(s.id); expanded.delete(s.id); render(); } }, 'Forget')));
+    const summary = h('button', {
+      class: 'history-row', type: 'button', 'aria-expanded': String(!details.hidden),
+      onclick: () => {
+        details.hidden = !details.hidden;
+        if (details.hidden) expanded.delete(s.id);
+        else expanded.add(s.id);
+        summary.setAttribute('aria-expanded', String(!details.hidden));
+      },
+    },
+    h('span', { class: 'history-swap' },
+      h('span', { class: 'nowrap' }, `${show(s.direction === 'L2P' ? BigInt(s.terms.liquid_amount) / 100n : s.terms.polygon_amount)} ${from}`), ' ',
+      h('span', { class: 'nowrap' }, `→ ${to}`)),
+    h('span', { class: 'mono history-state' }, s.state),
+    h('span', { class: 'history-date' }, new Date(s.created_at * 1000).toLocaleDateString(undefined, { dateStyle: 'short' })));
+    return h('div', { class: 'history-item' }, summary, details);
+  });
+  return [h('div', { class: 'list history' },
+    h('div', { class: 'history-head' }, ['Swap', 'Status', 'Date'].map((t) => h('span', {}, t))),
+    items)];
+}
+
+// Support material, Boltz-style: copy it, save it, or clear it. It only leaves this browser if the user sends it.
+function logsRow() {
+  const note = h('p', { class: 'note', id: 'logs-note' }, `${logsCount()} lines. Secrets are removed, and these stay in this browser until you share them.`);
+  const copy = h('button', {
+    class: 'icon-btn', id: 'logs-copy', title: 'Copy logs', 'aria-label': 'Copy logs',
+    onclick: async () => {
+      try {
+        await navigator.clipboard.writeText(logsText());
+        note.textContent = 'Copied.';
+      } catch (e) {
+        note.textContent = `Couldn't copy: ${e.message}`;
+      }
+    },
+  }, '⧉');
+  const save = h('button', {
+    class: 'icon-btn', id: 'logs-download', title: 'Download logs', 'aria-label': 'Download logs',
+    onclick: () => offerDownload(logsText(), `liq2sol-logs-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')}.txt`),
+  }, '⤓');
+  const del = h('button', {
+    class: 'icon-btn danger', id: 'logs-delete', title: 'Delete logs', 'aria-label': 'Delete logs',
+    onclick: () => { clearLogs(); note.textContent = 'Logs deleted.'; },
+  }, '🗑');
+  return [h('div', { class: 'setting-row' }, h('span', {}, 'Logs'), h('span', { class: 'icon-btns' }, copy, save, del)), note];
+}
+
+// The switch between test networks and mainnet. Each keeps its own swaps and settings, and switching reloads the page. A swap
+// in progress needs this page to keep watching it, so the switch waits until none is.
+function networkRow() {
+  const other = NETWORK.name === 'mainnet' ? 'testnet' : 'mainnet';
+  const unfinished = Object.values(loadSwaps()).filter((s) => !FINISHED.includes(s.state)).length;
+  const why = other === 'mainnet' && !mainnetAvailable() ? 'Mainnet is not available yet.'
+    : unfinished ? `Finish or cancel your ${unfinished === 1 ? 'swap' : `${unfinished} swaps`} in progress first: this page has to keep watching ${unfinished === 1 ? 'it' : 'them'}.`
+      : other === 'mainnet' ? 'Mainnet uses real funds, up to 1000 USDT0 a swap. Your test swaps and settings stay here for when you switch back.'
+        : 'Your mainnet swaps and settings stay here for when you switch back.';
+  const go = h('button', {
+    class: 'btn quiet', id: 'switch-network', disabled: (other === 'mainnet' && !mainnetAvailable()) || unfinished > 0,
+    onclick: () => chooseNetwork(other),
+  }, other === 'mainnet' ? 'Switch to mainnet' : 'Switch to test networks');
+  return [
+    h('h4', {}, 'Network'),
+    h('div', { class: 'setting-row' }, h('span', { id: 'network-now' }, NETWORK.label), go),
+    h('p', { class: 'note', id: 'network-note' }, why),
+  ];
+}
+
+function settingsDialog() {
+  const field = (label, id, value, placeholder = '') => h('label', { class: 'field' }, h('span', {}, label), h('input', { class: 'input', id, value: value ?? '', placeholder }));
+  const dialog = h('dialog', {},
+    h('h3', {}, 'Settings'),
+    field('First Liquid Esplora', 's-e1', settings.esplora?.[0], NETWORK.esplora[0]),
+    field('Second Liquid Esplora', 's-e2', settings.esplora?.[1], NETWORK.esplora[1]),
+    field('First Polygon RPC', 's-p1', settings.polygon, NETWORK.polygon[0]),
+    field('Second Polygon RPC, from another provider. A claim waits until both agree.', 's-p2', settings.polygon2, NETWORK.polygon[1]),
+    field('Nostr relays, separated by spaces', 's-relays', settings.relays?.join(' '), NETWORK.relays.join(' ')),
+    field('Largest spread to accept, in basis points', 's-spread', settings.maxSpreadBps, String(NETWORK.maxSpreadBps)),
+    ...networkRow(),
+    h('h4', {}, 'Support'),
+    logsRow(),
+    h('button', {
+      class: 'btn',
+      onclick: () => {
+        const v = (id) => $(id).value.trim();
+        settings.esplora = v('s-e1') || v('s-e2') ? [v('s-e1') || NETWORK.esplora[0], v('s-e2') || NETWORK.esplora[1]] : undefined;
+        settings.polygon = v('s-p1') || undefined;
+        settings.polygon2 = v('s-p2') || undefined;
+        settings.relays = v('s-relays') ? v('s-relays').split(/\s+/) : undefined;
+        settings.maxSpreadBps = v('s-spread') ? Number(v('s-spread')) : undefined;
+        saveSettings(settings);
+        dialog.close();
+        dialog.remove();
+        endpoints();
+        engine.esplora = esplora;
+        engine.polygon = polygon;
+        startRelays();
+        render();
+      },
+    }, 'Save'),
+    h('button', { class: 'btn quiet', onclick: () => { dialog.close(); dialog.remove(); } }, 'Cancel'));
+  document.body.append(dialog);
+  dialog.showModal();
+}
+
+// ---- Render and run ----
+// ---- The faucet, on test networks only ----
+function faucetView() {
+  const f = NETWORK.faucet;
+  const status = h('p', { class: 'note', id: 'faucet-status', role: 'status', 'data-live': '' });
+  const balance = h('p', { class: 'note', id: 'faucet-balance', 'data-live': '' });
+  const showBalance = async () => {
+    if (!wallet) return;
+    const [units, wei] = await Promise.all([polygon.tokenBalance(NETWORK.token, wallet.address), polygon.balance(wallet.address)]);
+    balance.textContent = `This wallet holds ${show(units)} ${NETWORK.tokenName} and ${pol(wei)}.`;
+  };
+  showBalance().catch(() => {});
+  const button = h('button', { class: 'btn', id: 'drip', onclick: () => claim() }, `Get ${f.drip} ${NETWORK.tokenName}`);
+  const claim = async () => {
+    button.disabled = true;
+    try {
+      if (await polygon.balance(wallet.address) < NETWORK.minPolWei) throw new Error('This wallet needs a little test POL first. Get some from the link above.');
+      const before = await polygon.tokenBalance(NETWORK.token, wallet.address);
+      const call = { from: wallet.address, to: NETWORK.token, data: W.build_faucet_call((BigInt(f.drip) * 1000000n).toString()) };
+      await polygon.simulate(call);
+      status.textContent = `Waiting for ${wallet.name}…`;
+      await wallet.send(call);
+      status.textContent = `${f.drip} ${NETWORK.tokenName} are on the way.`;
+      for (let i = 0; i < 30 && (await polygon.tokenBalance(NETWORK.token, wallet.address)) === before; i++) await new Promise((r) => setTimeout(r, 1500));
+      await showBalance();
+    } catch (err) {
+      status.textContent = '';
+      fail(err);
+    } finally {
+      button.disabled = false;
+    }
+  };
+  const link = (href, text) => h('a', { href, target: '_blank', rel: 'noopener noreferrer' }, text);
+  return h('div', { class: 'card faucet' },
+    h('h2', {}, 'Try a swap'),
+    h('p', { class: 'sub' }, `Everything here is on test networks, and has no value. ${NETWORK.tokenName} stands in for USDT0, which has no testnet.`),
+    h('ol', { class: 'faucet-steps' },
+      h('li', {}, `Connect a wallet. It is asked to add ${NETWORK.chainParams.chainName} if it doesn't know it.`),
+      h('li', {}, 'Get a little test POL for fees from ', link(f.pol, 'the Polygon faucet'), '.'),
+      h('li', {}, `Get ${f.drip} ${NETWORK.tokenName} below.`),
+      h('li', {}, `Swap ${NETWORK.tokenName} → L-USDt. You only need a Liquid address, because the maker provides the fee coin for your claim.`),
+      h('li', {}, 'To swap back, your Liquid wallet needs L-BTC for fees, from ', link(f.liquid, 'the Liquid testnet faucet'), '. The maker sends POL for your Polygon claim.')),
+    wallet ? walletView() : null,
+    balance,
+    wallet
+      ? button
+      : [h('button', { class: 'btn', id: 'faucet-connect', onclick: connectWallet }, 'Connect a Polygon wallet'), qrButton()],
+    status,
+    h('p', { class: 'note', id: 'sideswap-note' }, 'To get testnet USDt on Liquid, swap L-BTC for it in the SideSwap wallet. It’s the same asset as here:'),
+    h('div', { class: 'addr' }, NETWORK.usdt));
+}
+
+const HERO = () => h('div', { class: 'hero' }, h('h1', {}, h('img', { class: 'hero-mark', src: 'tether.svg', alt: '', width: 48, height: 48 }), 'Liquid ⇄ Polygon Atomic Swaps'), h('p', {}, 'Swap USDt across chains while staying in full control. Nobody can link the two sides.'));
+
+function render() {
+  const tab = (location.hash.replace('#', '') || 'swap');
+  document.querySelectorAll('.tab[data-tab]').forEach((a) => a.classList.toggle('on', a.dataset.tab === tab));
+  const view = $('view');
+  const below = $('below');
+  const showForm = tab !== 'rescue' && tab !== 'history' && tab !== 'faucet' && !(ui.openOrder && orderOf(ui.openOrder).length) && !ui.quote;
+  // A file picker or a half-typed address shouldn't vanish when the chain is polled. Going back to the form isn't a poll, so it goes ahead.
+  const active = document.activeElement;
+  if (!showForm && active && (active.classList?.contains('refund-to') || active.type === 'file' || active.tagName === 'TEXTAREA') && view.contains(active)) return;
+  if (showForm) {
+    if (!form.el.isConnected) {
+      view.replaceChildren(form.el);
+      view.dataset.view = 'form';
+      below.replaceChildren(book.el, HERO());
+    }
+    updateForm();
+    return;
+  }
+  below.replaceChildren();
+  // In place only within one view. Switching starts afresh: patching the form's own card into a swap's had left the form element
+  // on the page in disguise, so Back, finding it there, never brought the form back.
+  const which = tab === 'rescue' || tab === 'history' || (tab === 'faucet' && NETWORK.faucet) ? tab : ui.openOrder ? `order:${ui.openOrder}` : 'quote';
+  if (view.dataset.view !== which || form.el.isConnected) {
+    view.replaceChildren();
+    view.dataset.view = which;
+  }
+  if (tab === 'rescue') {
+    patch(view, [rescueView()]);
+  } else if (tab === 'history') {
+    patch(view, [historyView()].flat());
+  } else if (tab === 'faucet' && NETWORK.faucet) {
+    patch(view, [faucetView()]);
+  } else if (ui.openOrder && orderOf(ui.openOrder).length) {
+    patch(view, orderView(orderOf(ui.openOrder)).flat().filter(Boolean));
+  } else {
+    patch(view, [quoteView()]);
+  }
+}
+
+// Puts the new view in place, keeping each part that looks exactly the same as what is shown. A swap's page is drawn again on every
+// check, and History every few seconds, and replacing it all made the page blink. A kept part keeps its old handlers, which act on
+// a swap by its id, or on what can't change any more.
+function patch(parent, nodes) {
+  const old = [...parent.childNodes];
+  nodes.forEach((node, i) => {
+    if (!old[i]) parent.append(node);
+    else if (!morph(old[i], node)) parent.replaceChild(node, old[i]);
+  });
+  for (const extra of old.slice(nodes.length)) extra.remove();
+}
+
+// Makes `old` look like `node` in place, down to the text, and says whether it could. Something a person acts on (a button, link
+// or field) is kept only if it is exactly the same, so its handler is never one for something else. So is anything marked
+// data-live, which fills itself in after it is drawn: editing the one on screen would undo that, while the new one's filling went
+// to a copy nobody sees. Each starts from what it last showed, so a redraw usually finds it the same.
+const ACTED_ON = new Set(['BUTTON', 'A', 'INPUT', 'TEXTAREA', 'SELECT', 'CANVAS', 'DIALOG']);
+function morph(old, node) {
+  if (old.isEqualNode(node)) return true;
+  if (old.nodeType !== node.nodeType || old.nodeName !== node.nodeName) return false;
+  if (old.nodeType === Node.TEXT_NODE) {
+    old.nodeValue = node.nodeValue;
+    return true;
+  }
+  if (old.nodeType !== Node.ELEMENT_NODE || ACTED_ON.has(old.nodeName) || 'live' in old.dataset) return false;
+  for (const { name } of [...old.attributes]) if (!node.hasAttribute(name)) old.removeAttribute(name);
+  for (const { name, value } of [...node.attributes]) if (old.getAttribute(name) !== value) old.setAttribute(name, value);
+  patch(old, [...node.childNodes]);
+  return true;
+}
+
+// A swap waiting on a slow wallet holds up only itself, and ticks don't pile up behind it.
+const ticking = new Set();
+
+// Why a swap couldn't be checked last time, shown on its card until a check works again.
+const tickProblems = new Map();
+
+function tickAll() {
+  for (const s of Object.values(loadSwaps())) {
+    // An expired L→P swap gets one look per visit, in case a coin reached it after all (Engine.tick).
+    const recheck = s.state === 'expired' && s.direction === 'L2P' && !engine.recheckedExpired.has(s.id);
+    if ((FINISHED.includes(s.state) && !recheck) || ticking.has(s.id)) continue;
+    ticking.add(s.id);
+    withSwap(s.id, (fresh) => engine.tick(fresh))
+      .then(() => { if (tickProblems.delete(s.id)) render(); })
+      .catch((e) => {
+        console.warn('tick', e.message);
+        tickProblems.set(s.id, e.message.slice(0, 160));
+        render();
+      })
+      .finally(() => ticking.delete(s.id));
+  }
+}
+
+function navMenu() {
+  // The logo always opens a new swap, even from a swap's page, where the address doesn't change.
+  document.querySelector('a.logo').addEventListener('click', (e) => {
+    e.preventDefault();
+    ui.openOrder = null;
+    if (ui.quote) clearQuote();
+    if (location.hash !== '#swap') location.hash = '#swap';
+    render();
+  });
+  const burger = $('burger');
+  const menu = $('collapse');
+  const set = (open) => {
+    menu.classList.toggle('open', open);
+    burger.classList.toggle('active', open);
+    document.body.classList.toggle('menu-open', open);
+    burger.setAttribute('aria-expanded', String(open));
+  };
+  burger.addEventListener('click', () => set(!menu.classList.contains('open')));
+  menu.addEventListener('click', (e) => { if (e.target.closest('a')) set(false); });
+  // BTC Swaps, sol2base and eth2base open in this tab, as parts of one site. While a swap is unfinished they open in a new one, as the link
+  // says without this, so this tab stays and keeps the swap going.
+  for (const a of document.querySelectorAll('a[data-site]')) a.href = siteUrl(a.dataset.site);
+  for (const a of document.querySelectorAll('a[data-nsite]')) a.href = nsiteUrl(a.dataset.nsite);
+  if (nsiteGateway()) for (const note of document.querySelectorAll('[data-nsite-note]')) note.hidden = true;
+  for (const a of document.querySelectorAll('a[data-same-tab]')) {
+    a.addEventListener('click', (e) => {
+      if (e.button !== 0 || e.ctrlKey || e.metaKey || e.shiftKey || e.altKey) return;
+      if (Object.values(loadSwaps()).some((s) => !FINISHED.includes(s.state))) return;
+      e.preventDefault();
+      location.href = a.href;
+    });
+  }
+}
+
+// A published page pins its WebAssembly's hash in index.html (client/stamp.mjs), and nothing runs on other bytes. A copy served
+// straight from the repository has no pin.
+async function loadWasm() {
+  const want = document.querySelector('meta[name="wasm-sha256"]')?.content;
+  if (!want) return init();
+  // At an address carrying its hash, so a copy cached from an earlier build is never used.
+  const bytes = await (await fetch(new URL(`../wasm/liq2any_client_wasm_bg.wasm?v=${want.slice(0, 16)}`, import.meta.url))).arrayBuffer();
+  const got = Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', bytes)), (b) => b.toString(16).padStart(2, '0')).join('');
+  if (got !== want) throw new Error('This page\'s WebAssembly doesn\'t match its build, so nothing was run. Reload, or use a checked copy of the page.');
+  return init({ module_or_path: bytes });
+}
+
+// Neither GitHub Pages nor the nsite gateways send X-Frame-Options, and a meta CSP can't set frame-ancestors. So the page won't run
+// inside another page, where an overlay could steer the user's clicks (clickjacking), and offers itself in its own tab instead.
+function framed() {
+  try { return window.top !== window.self; } catch { return true; }
+}
+
+async function main() {
+  if (framed()) {
+    $('view').replaceChildren(h('div', { class: 'card' },
+      h('p', {}, 'This page does not run inside another page.'),
+      h('p', {}, h('a', { href: location.href, target: '_blank', rel: 'noopener noreferrer' }, 'Open it in its own tab'))));
+    return;
+  }
+  navMenu();
+  // The deploy stamps the build. A copy served straight from the repo says so instead of showing the placeholder.
+  const build = $('build');
+  if (build.textContent.startsWith('__')) {
+    build.textContent = 'local';
+    build.href = 'https://github.com/SwapMarket/liq2any';
+  }
+  captureConsole();
+  log('info', `started, build ${document.querySelector('#build')?.textContent ?? ''}, ${navigator.userAgent}`);
+  await loadWasm();
+  if (NETWORK.regtest) W.use_regtest(NETWORK.usdt, NETWORK.lbtc);
+  else if (NETWORK.name === 'mainnet') W.use_mainnet();
+  endpoints();
+  // Only test networks are labelled: mainnet is the default, and needs no badge.
+  $('net').textContent = NETWORK.label;
+  $('net').hidden = NETWORK.name === 'mainnet';
+  document.documentElement.dataset.network = NETWORK.name;
+  document.querySelector('.tab[data-tab="faucet"]').hidden = !NETWORK.faucet;
+  // SwapMarket's bridges, for the next hop once funds are on mainnet.
+  for (const a of document.querySelectorAll('.mainnet-only')) a.hidden = NETWORK.name !== 'mainnet';
+  engine = new Engine({
+    esplora, polygon, secondPolygon, getWallet: () => wallet, relays: null,
+    onChange: () => { if (ui.openOrder) render(); },
+    allowOneEndpoint: () => !!settings.allowOneEndpoint,
+  });
+  startRelays();
+  const open = Object.values(loadSwaps()).filter((s) => !FINISHED.includes(s.state)).sort((a, b) => b.created_at - a.created_at)[0];
+  if (open) ui.openOrder = open.order ?? open.id;
+  window.addEventListener('hashchange', render);
+  render();
+  restoreWallet();
+  try {
+    checkGenesis(NETWORK, await esplora[0].genesis(), await polygon.chainId());
+  } catch (e) {
+    relays.close();
+    fail(e);
+    engine = null;
+    return;
+  }
+  setInterval(() => tickAll(), NETWORK.pollMs);
+  // The current step's timer, between redraws.
+  setInterval(() => {
+    for (const el of document.querySelectorAll('.step-time.live')) el.textContent = duration(now() - Number(el.dataset.since));
+    const left = document.getElementById('quote-left');
+    if (left) {
+      const secs = Number(left.dataset.until) - now();
+      if (secs > 0) left.textContent = `${secs} s`;
+      else render();
+    }
+  }, 1000);
+  tickAll();
+  // Wallet extensions can register after load, and offers can expire.
+  setInterval(() => {
+    if (form.el.isConnected) updateForm();
+    else if (location.hash === '#history') render();
+  }, 5000);
+}
+
+main().catch((e) => {
+  // Don't leave it spinning as if it were still loading.
+  document.querySelector('.page-loading')?.remove();
+  fail(e);
+});
