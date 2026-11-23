@@ -155,6 +155,12 @@ stolen hot key.** The vault is one address Tether can block, which stops its loc
 own swap vault, still settle. So the maker keeps its balance near operating needs. The vault has no other functions, and holds
 no POL: the operator pays gas and gas drops from its own.
 
+**In the maker.** The signer's optional `polygon.maker_vault` names the vault. It refuses to start unless the vault is for the
+configured escrow, has the signer's key as its operator, and has a cap above zero. Then the vault is the address the signer gives
+the daemon, and so the one in the terms; locks, releases and extensions go to the vault; the capacity offered is the vault's
+USDT0 or the cap left in its window, whichever is less; and the signer refuses to approve or to withdraw USDT0, which only the
+owner can. A lock over the cap fails the signer's simulation, so it is never signed. The daemon needs no change.
+
 ### 2.7 Tests
 
 Foundry, in `contracts/polygon/`, with these suites:

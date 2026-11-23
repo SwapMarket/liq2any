@@ -212,6 +212,52 @@ pub fn lock_call(
     )
 }
 
+/// `MakerVault.lock`: the escrow's `lock` from the vault's coins, always the short leg (docs/design.md section 2.6). The vault's
+/// `release` and `extend` take the same calldata as the escrow's, so only where they're sent changes.
+pub const VAULT_LOCK: &str = "lock(address,address,uint128,uint64,uint64,address)";
+
+pub fn vault_lock_call(
+    lock_address: &Address,
+    recipient: &Address,
+    amount: u128,
+    deadline_time: u64,
+    deadline_block: u64,
+    gas_to: &Address,
+) -> Vec<u8> {
+    calldata(
+        VAULT_LOCK,
+        &[
+            Word::Address(*lock_address),
+            Word::Address(*recipient),
+            Word::Uint(amount),
+            Word::Uint(u128::from(deadline_time)),
+            Word::Uint(u128::from(deadline_block)),
+            Word::Address(*gas_to),
+        ],
+    )
+}
+
+/// A maker vault's settings and its current window, as its public getters give them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VaultState {
+    pub escrow: Address,
+    pub operator: Address,
+    pub window_secs: u64,
+    pub window_cap: u128,
+    pub window_start: u64,
+    pub window_used: u128,
+}
+
+impl VaultState {
+    /// How much the vault would let us lock at `now`: its `afterLock` rule. A window ends `window_secs` after it starts.
+    pub fn room(&self, now: u64) -> u128 {
+        // In 128 bits, as the contract adds in 256: a window never ends early by saturating.
+        let ended = u128::from(now) >= u128::from(self.window_start) + u128::from(self.window_secs);
+        let used = if ended { 0 } else { self.window_used };
+        self.window_cap.saturating_sub(used)
+    }
+}
+
 pub fn claim_call(id: &[u8; 32], revealed: &[u8; 32]) -> Vec<u8> {
     calldata(CLAIM, &[Word::Bytes32(*id), Word::Bytes32(*revealed)])
 }
@@ -338,6 +384,19 @@ impl Rpc {
 
     pub fn vault_implementation(&self, escrow: &Address) -> Res<Address> {
         word_address(&self.call_at(escrow, &calldata("vaultImplementation()", &[]), "latest")?, 0)
+    }
+
+    /// A maker vault's state at `latest`.
+    pub fn vault_state(&self, vault: &Address) -> Res<VaultState> {
+        let get = |getter: &str| self.call_at(vault, &calldata(getter, &[]), "latest");
+        Ok(VaultState {
+            escrow: word_address(&get("escrow()")?, 0)?,
+            operator: word_address(&get("operator()")?, 0)?,
+            window_secs: u64::try_from(word_u128(&get("windowSecs()")?, 0)?).map_err(|_| "windowSecs over 64 bits")?,
+            window_cap: word_u128(&get("windowCap()")?, 0)?,
+            window_start: u64::try_from(word_u128(&get("windowStart()")?, 0)?).map_err(|_| "windowStart over 64 bits")?,
+            window_used: word_u128(&get("windowUsed()")?, 0)?,
+        })
     }
 
     pub fn is_blocked(&self, token: &Address, who: &Address, tag: &str) -> Res<bool> {

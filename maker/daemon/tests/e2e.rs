@@ -15,6 +15,8 @@
 //! (ignored by git), and topped up with POL from the Amoy deployer's key, `contracts/polygon/.keys/amoy-deployer.json`. A run
 //! costs about 0.45 POL. Amoy can't be halted or hurried, so the finality stall runs only on anvil, and waits for a deadline
 //! are real ones.
+//!
+//! `MAKER_VAULT=1` runs it, on anvil, with the maker locking through a maker vault (docs/design.md section 2.6).
 
 use std::collections::{HashMap, HashSet};
 use std::os::unix::fs::PermissionsExt;
@@ -99,6 +101,23 @@ fn accounts() -> &'static Accounts {
 
 fn amoy() -> bool {
     std::env::var("POLYGON").is_ok_and(|v| v == "amoy")
+}
+
+/// `MAKER_VAULT=1`: the maker locks through a maker vault (docs/design.md section 2.6), which is then its Polygon address.
+fn with_vault() -> bool {
+    std::env::var("MAKER_VAULT").is_ok_and(|v| v == "1")
+}
+
+/// Deploy from `contracts/polygon` with the deployer's key.
+fn forge_create(url: &str, args: &[&str]) -> EvmAddress {
+    let contracts = concat!(env!("CARGO_MANIFEST_DIR"), "/../../contracts/polygon");
+    let deployer = &accounts().deployer_key;
+    let mut all = vec!["create", "--rpc-url", url, "--private-key", deployer, "--broadcast", "--json"];
+    all.extend_from_slice(args);
+    let out = Command::new("forge").args(&all).current_dir(contracts).output().expect("forge");
+    assert!(out.status.success(), "forge create: {}", String::from_utf8_lossy(&out.stderr));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    EvmAddress::parse(v["deployedTo"].as_str().unwrap()).unwrap()
 }
 
 fn address_of(key: &str) -> EvmAddress {
@@ -360,19 +379,21 @@ impl Evm {
             std::thread::sleep(Duration::from_millis(100));
         }
         cast(&["rpc", "anvil_mine", "0x834", "0x1", "--rpc-url", &url]).unwrap();
-        let contracts = concat!(env!("CARGO_MANIFEST_DIR"), "/../../contracts/polygon");
-        let deployer = &accounts().deployer_key;
-        let deploy = |args: &[&str]| -> EvmAddress {
-            let mut all = vec!["create", "--rpc-url", &url, "--private-key", deployer, "--broadcast", "--json"];
-            all.extend_from_slice(args);
-            let out = Command::new("forge").args(&all).current_dir(contracts).output().expect("forge");
-            assert!(out.status.success(), "forge create: {}", String::from_utf8_lossy(&out.stderr));
-            let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
-            EvmAddress::parse(v["deployedTo"].as_str().unwrap()).unwrap()
-        };
+        let deploy = |args: &[&str]| forge_create(&url, args);
         let token = deploy(&["src/testnet/StandInUSDT0.sol:StandInUSDT0"]);
         let escrow = deploy(&["src/Escrow.sol:Escrow", "--constructor-args", &token.to_string(), "1209600", "604800"]);
         Evm { child: Some(child), url, rpc, escrow, token, block_ms: 1_000 }
+    }
+
+    /// A maker vault for the maker's key, owned by the deployer, which plays the maker's cold key, and funded by it.
+    fn maker_vault(&self, operator: &EvmAddress) -> EvmAddress {
+        let deployer = &accounts().deployer_key;
+        let (escrow, operator, owner) = (self.escrow.to_string(), operator.to_string(), address_of(deployer).to_string());
+        let args = ["src/MakerVault.sol:MakerVault", "--constructor-args", &escrow, &owner, &operator, "86400", "1000000000000"];
+        let vault = forge_create(&self.url, &args);
+        self.send(deployer, &self.token, "faucet(uint256)", &["1000000000"]).unwrap();
+        self.send(deployer, &self.token, "transfer(address,uint256)", &[&vault.to_string(), "1000000000"]).unwrap();
+        vault
     }
 
     /// Amoy, with the contracts already deployed there.
@@ -1380,6 +1401,13 @@ fn build_world(root: &Path) -> World {
         evm.send(&a.taker_key, &evm.token, "approve(address,uint256)", &[&evm.escrow.to_string(), &u128::MAX.to_string()]).unwrap();
     }
 
+    let vault = with_vault().then(|| {
+        assert!(!evm.public(), "MAKER_VAULT runs on anvil only");
+        let vault = evm.maker_vault(&a.maker);
+        println!("Maker vault at {vault}, operated by the maker's key");
+        vault
+    });
+
     // The signer's Polygon key: anvil's account #2, which holds test ETH from the start, or our Amoy test key.
     let keys = root.join("keys");
     std::fs::create_dir_all(&keys).unwrap();
@@ -1416,6 +1444,7 @@ fn build_world(root: &Path) -> World {
             escrow: Some(evm.escrow.to_string()),
             token: Some(evm.token.to_string()),
             fees: Default::default(),
+            maker_vault: vault.map(|v| v.to_string()),
         },
         limits: Limits::from(&engine),
         regtest_assets: assets.clone(),
@@ -1435,7 +1464,10 @@ fn build_world(root: &Path) -> World {
     let mut client = Client::connect(&socket).unwrap();
     let Reply::Identity { liquid_address, polygon, .. } = client.call(&Call::Identity).unwrap() else { panic!() };
     let maker = EvmAddress::parse(&polygon).unwrap();
-    assert_eq!(maker, a.maker, "the signer runs on the maker's key, from the key file");
+    match vault {
+        Some(vault) => assert_eq!(maker, vault, "with a vault, the vault is the maker's Polygon address"),
+        None => assert_eq!(maker, a.maker, "the signer runs on the maker's key, from the key file"),
+    }
 
     let pages = root.join("pages.log");
     let db = root.join("maker.db");
@@ -1801,6 +1833,8 @@ fn start_second_maker(w: &World) -> Res<SecondMaker> {
     signer.socket = socket.clone();
     signer.ledger = root.join("signer.db");
     signer.keys_dir = keys;
+    // Its own key holds its USDT0, whether or not the first maker uses a vault.
+    signer.polygon.maker_vault = None;
     let signer_path = root.join("signer.json");
     std::fs::write(&signer_path, serde_json::to_string(&signer).map_err(err)?).map_err(err)?;
     let signer_proc = Proc { child: Command::new(signer_binary()).arg(&signer_path).spawn().map_err(err)? };

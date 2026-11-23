@@ -26,8 +26,8 @@ use liq2any_chain::liquid::{
     self, keypair_from, sign_keypath, usdt, use_network, NetworkConfig, Payment, SecretCoin, Wallet, FEE,
 };
 use liq2any_chain::polygon::{
-    self, approve_call, claim_call, extend_call, lock_call, lock_id, refund_call, release_call, Rpc as PolygonRpc,
-    State as LockState,
+    self, approve_call, claim_call, extend_call, lock_call, lock_id, refund_call, release_call, vault_lock_call,
+    Rpc as PolygonRpc, State as LockState,
 };
 use liq2any_chain::swap::{check_claim_shape, spent_outputs, swap_address, swap_output, taker_fee_address};
 use liq2any_maker_core::engine::Direction;
@@ -58,6 +58,8 @@ pub const MAX_CONNECTIONS: usize = 16;
 /// Gas limits, fixed per call so nothing depends on an estimate. Each is well above what the call used on a fork of Polygon
 /// mainnet and on Amoy (contracts/polygon/README.md); gas that isn't used isn't paid for.
 pub const LOCK_GAS: u64 = 400_000;
+/// A lock through a maker vault: its approval and cap on top of the escrow's lock, about 280,000 measured.
+pub const VAULT_LOCK_GAS: u64 = 450_000;
 pub const CLAIM_GAS: u64 = 250_000;
 pub const REFUND_GAS: u64 = 200_000;
 pub const RELEASE_GAS: u64 = 200_000;
@@ -87,6 +89,10 @@ pub struct PolygonConfig {
     pub token: Option<String>,
     #[serde(default)]
     pub fees: PolygonFees,
+    /// A `MakerVault` (docs/design.md section 2.6) whose operator is our Polygon key. With one, the vault is our Polygon
+    /// address in every swap and holds the USDT0; our key only signs and pays gas. Without one, our key does both.
+    #[serde(default)]
+    pub maker_vault: Option<String>,
 }
 
 /// EIP-1559 fees, in gwei. Polygon's validators require a priority fee of at least 25 gwei on mainnet.
@@ -385,7 +391,10 @@ pub struct Signer {
     wallet_secrets: ([u8; 32], [u8; 32]),
     fresh_addresses: bool,
     polygon_key: evm::SecretKeyEvm,
+    /// Our key's address: it signs, pays gas, and keeps the nonce.
     me: EvmAddress,
+    /// The maker vault, if any. `holder()` is the address swaps see.
+    vault: Option<EvmAddress>,
     swap_seed: [u8; 32],
     fee_coin_sats: u64,
     sessions: HashMap<[u8; 32], OpenSession>,
@@ -481,6 +490,14 @@ impl Signer {
         let polygon_key = evm::SecretKeyEvm::from_slice(&load_or_create_secret(&cfg.keys_dir.join("polygon.key"))?)
             .map_err(|e| format!("bad Polygon key: {e}"))?;
         let me = address_of(&polygon_key);
+        let vault = parse("maker_vault", &cfg.polygon.maker_vault)?;
+        if let Some(vault) = &vault {
+            check_vault(
+                &polygon.vault_state(vault).map_err(|e| format!("refusing to start: polygon.maker_vault: {e}"))?,
+                &ids,
+                &me,
+            )?;
+        }
         Ok(Self {
             limits: cfg.limits.clone(),
             chain,
@@ -494,6 +511,7 @@ impl Signer {
             fresh_addresses: cfg.fresh_addresses,
             polygon_key,
             me,
+            vault,
             swap_seed,
             fee_coin_sats: cfg.fee_coin_sats,
             sessions: HashMap::new(),
@@ -634,14 +652,25 @@ impl Signer {
         Ok(Reply::Liquid(hex(&raw)))
     }
 
+    /// Our Polygon address in swaps: the vault's when there is one, else our key's.
+    fn holder(&self) -> EvmAddress {
+        self.vault.unwrap_or(self.me)
+    }
+
     fn polygon_usdt(&self) -> Result<u64, String> {
-        let balance = self.polygon.token_balance(&self.ids.token, &self.me, "latest")?;
+        let balance = self.polygon.token_balance(&self.ids.token, &self.holder(), "latest")?;
         u64::try_from(balance).map_err(|_| "a USDT0 balance over 64 bits".to_string())
     }
 
+    /// What we can lock now: the USDT0 held, and with a vault, no more than its window still allows.
     fn capacity(&self) -> Outcome {
         let liquid_units = self.payable_coins()?.iter().filter(|c| c.secrets.asset == usdt()).map(|c| c.secrets.value).sum();
-        Ok(Reply::Capacity { polygon_units: self.polygon_usdt()?, liquid_units })
+        let mut polygon_units = self.polygon_usdt()?;
+        if let Some(vault) = &self.vault {
+            let room = self.polygon.vault_state(vault)?.room(self.polygon.block("latest")?.time);
+            polygon_units = polygon_units.min(u64::try_from(room).unwrap_or(u64::MAX));
+        }
+        Ok(Reply::Capacity { polygon_units, liquid_units })
     }
 
     fn balances(&self) -> Outcome {
@@ -655,7 +684,11 @@ impl Signer {
             free_fee_coins,
             polygon_usdt: self.polygon_usdt()?,
             pol_wei: self.polygon.balance(&self.me, "latest")?,
-            polygon_allowance: self.polygon.allowance(&self.ids.token, &self.me, &self.ids.escrow)?,
+            // A vault approves each lock itself, so there is nothing for us to approve.
+            polygon_allowance: match self.vault {
+                Some(_) => u128::MAX,
+                None => self.polygon.allowance(&self.ids.token, &self.me, &self.ids.escrow)?,
+            },
         })
     }
 
@@ -716,6 +749,9 @@ impl Signer {
         let none = [0u8; 32];
         match (asset, amount) {
             (_, Some(0)) => Err("nothing to withdraw".to_string().into()),
+            (Asset::Usdt, _) if self.vault.is_some() => {
+                Err("the vault's USDT0 is withdrawn by its owner, not by this key".to_string().into())
+            }
             (Asset::Usdt, amount) => {
                 let amount = match amount {
                     Some(a) => a,
@@ -882,6 +918,9 @@ impl Signer {
     }
 
     fn approve_escrow(&self) -> Outcome {
+        if self.vault.is_some() {
+            return Err("with a maker vault there is nothing to approve: the vault approves each lock".to_string().into());
+        }
         let none = [0u8; 32];
         let signed = self.sign_polygon(self.ids.token, 0, approve_call(&self.ids.escrow, u128::MAX), APPROVE_GAS, true)?;
         self.commit_polygon(&none, &signed)?;
@@ -1049,20 +1088,23 @@ impl Signer {
             recipient_blocked: self.polygon.is_blocked(&self.ids.token, &taker, "latest")?,
         };
         let record = self.check(&request)?;
-        let allowance = self.polygon.allowance(&self.ids.token, &self.me, &self.ids.escrow)?;
-        if allowance < u128::from(t.polygon_amount) {
-            return Err("the escrow isn't approved for our USDT0: call ApproveEscrow".into());
-        }
-        let data = lock_call(
-            &lock_address(&t.lock_point)?,
-            &taker,
-            u128::from(t.polygon_amount),
-            deadline_time,
-            deadline_block,
-            false,
-            &gas_to,
-        );
-        let signed = self.sign_polygon(self.ids.escrow, t.gas_drop, data, LOCK_GAS, true)?;
+        let lock_address = lock_address(&t.lock_point)?;
+        let amount = u128::from(t.polygon_amount);
+        let (to, data, gas) = match self.vault {
+            // The vault checks its own cap; the simulation below refuses a lock over it.
+            Some(vault) => {
+                (vault, vault_lock_call(&lock_address, &taker, amount, deadline_time, deadline_block, &gas_to), VAULT_LOCK_GAS)
+            }
+            None => {
+                let allowance = self.polygon.allowance(&self.ids.token, &self.me, &self.ids.escrow)?;
+                if allowance < amount {
+                    return Err("the escrow isn't approved for our USDT0: call ApproveEscrow".into());
+                }
+                let data = lock_call(&lock_address, &taker, amount, deadline_time, deadline_block, false, &gas_to);
+                (self.ids.escrow, data, LOCK_GAS)
+            }
+        };
+        let signed = self.sign_polygon(to, t.gas_drop, data, gas, true)?;
         self.commit(&id, &request, &record, None, Some(&signed))?;
         Ok(polygon_reply(&signed))
     }
@@ -1073,7 +1115,8 @@ impl Signer {
         let address = lock_address(lock_point)?;
         let id = lock_id(&taker, &address);
         let lock = self.polygon.lock_at(&self.ids.escrow, &id, "finalized")?;
-        let ours = lock.state == LockState::Open && lock.lock_address == address && lock.recipient == self.me && lock.long_leg;
+        let ours =
+            lock.state == LockState::Open && lock.lock_address == address && lock.recipient == self.holder() && lock.long_leg;
         Ok((lock, id, ours))
     }
 
@@ -1109,7 +1152,7 @@ impl Signer {
             lock_height: t.lock_height,
             liquid_tip: self.chain.tip()?,
             taker_escrow,
-            maker_blocked: self.polygon.is_blocked(&self.ids.token, &self.me, "latest")?,
+            maker_blocked: self.polygon.is_blocked(&self.ids.token, &self.holder(), "latest")?,
         };
         let record = self.check(&request)?;
         let payments = vec![
@@ -1207,7 +1250,7 @@ impl Signer {
         let request = Request::ClaimPolygon { lock_point, secret };
         let record = self.check(&request)?;
         let (lock, id, _) = self.taker_lock(taker_polygon, &lock_point)?;
-        if lock.recipient != self.me {
+        if lock.recipient != self.holder() {
             return Err("that lock doesn't pay us".into());
         }
         let revealed = polygon_value(&secret).map_err(|e| e.to_string())?;
@@ -1241,7 +1284,7 @@ impl Signer {
     fn refund_polygon(&self, lock_point: LockPoint) -> Outcome {
         let request = Request::RefundPolygon { swap_id: lock_point.id() };
         let record = self.check(&request)?;
-        let id = lock_id(&self.me, &lock_address(&lock_point)?);
+        let id = lock_id(&self.holder(), &lock_address(&lock_point)?);
         let signed = self.sign_polygon(self.ids.escrow, 0, refund_call(&id), REFUND_GAS, true)?;
         self.commit(&lock_point.id(), &request, &record, None, Some(&signed))?;
         Ok(polygon_reply(&signed))
@@ -1261,7 +1304,9 @@ impl Signer {
             liquid_tip_age_secs: now_secs().saturating_sub(self.chain.tip_time()?),
         };
         let record = self.check(&request)?;
-        let signed = self.sign_polygon(self.ids.escrow, 0, extend_call(&id, new_time, new_block), EXTEND_GAS, true)?;
+        // The escrow takes `extend` only from the lock's recipient: the vault, when there is one, passes ours on.
+        let to = self.vault.unwrap_or(self.ids.escrow);
+        let signed = self.sign_polygon(to, 0, extend_call(&id, new_time, new_block), EXTEND_GAS, true)?;
         self.commit(&lock_point.id(), &request, &record, None, Some(&signed))?;
         Ok(polygon_reply(&signed))
     }
@@ -1271,7 +1316,8 @@ impl Signer {
         let request = Request::Release { swap_id: lock_point.id() };
         let record = self.check(&request)?;
         let (_, id, _) = self.taker_lock(taker_polygon, &lock_point)?;
-        let signed = self.sign_polygon(self.ids.escrow, 0, release_call(&id), RELEASE_GAS, true)?;
+        let to = self.vault.unwrap_or(self.ids.escrow);
+        let signed = self.sign_polygon(to, 0, release_call(&id), RELEASE_GAS, true)?;
         self.commit(&lock_point.id(), &request, &record, None, Some(&signed))?;
         Ok(polygon_reply(&signed))
     }
@@ -1280,7 +1326,7 @@ impl Signer {
         let outcome: Outcome = match call {
             Call::Identity => Ok(Reply::Identity {
                 liquid_address: self.wallet.address().to_string(),
-                polygon: self.me.to_string(),
+                polygon: self.holder().to_string(),
                 fee_coin_sats: self.fee_coin_sats,
             }),
             Call::SwapKey { swap_id } => self.maker_key(swap_id).map(|key| Reply::SwapKey { key }).map_err(Stop::Failed),
@@ -1318,6 +1364,20 @@ impl Signer {
             Err(Stop::Failed(e)) => Reply::Failed(e),
         }
     }
+}
+
+/// A maker vault we may use: for our escrow, with our key as its operator, and a window it can lock in at all.
+fn check_vault(state: &polygon::VaultState, ids: &polygon::Ids, me: &EvmAddress) -> Result<(), String> {
+    if state.escrow != ids.escrow {
+        return Err(format!("refusing to start: the maker vault is for escrow {}, not ours ({})", state.escrow, ids.escrow));
+    }
+    if state.operator != *me {
+        return Err(format!("refusing to start: the maker vault's operator is {}, not our key ({me})", state.operator));
+    }
+    if state.window_cap == 0 {
+        return Err("refusing to start: the maker vault's cap is zero, so it can't lock anything".into());
+    }
+    Ok(())
 }
 
 fn polygon_reply(signed: &SignedCall) -> Reply {
@@ -1493,6 +1553,27 @@ impl Client {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_our_own_vault_is_used() {
+        let me = EvmAddress([2; 20]);
+        let ids = polygon::Ids { chain_id: 80002, escrow: EvmAddress([1; 20]), token: EvmAddress([9; 20]) };
+        let good = polygon::VaultState {
+            escrow: ids.escrow,
+            operator: me,
+            window_secs: 86_400,
+            window_cap: 1,
+            window_start: 0,
+            window_used: 0,
+        };
+        assert_eq!(check_vault(&good, &ids, &me), Ok(()));
+        let other_escrow = polygon::VaultState { escrow: EvmAddress([3; 20]), ..good };
+        assert!(check_vault(&other_escrow, &ids, &me).unwrap_err().contains("not ours"));
+        let other_operator = polygon::VaultState { operator: EvmAddress([4; 20]), ..good };
+        assert!(check_vault(&other_operator, &ids, &me).unwrap_err().contains("operator is"));
+        let no_cap = polygon::VaultState { window_cap: 0, ..good };
+        assert!(check_vault(&no_cap, &ids, &me).unwrap_err().contains("cap is zero"));
+    }
 
     #[test]
     fn the_example_config_stays_inside_the_folder_it_is_copied_to() {

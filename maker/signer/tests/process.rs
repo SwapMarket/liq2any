@@ -4,6 +4,8 @@
 //!
 //!   ELEMENTSD=~/bin/elementsd ELEMENTS_CLI=~/bin/elements-cli cargo test -p liq2any-signer --test process -- --ignored --nocapture
 //!
+//! The suite runs twice: with the signer's key holding the USDT0, and through a maker vault (docs/design.md section 2.6).
+//!
 //! Needs Foundry (`anvil`, `forge`, `cast`) on the PATH. Test networks only: anvil's well-known keys hold nothing real.
 
 use std::os::unix::fs::PermissionsExt;
@@ -42,6 +44,11 @@ const DEPLOYER_KEY: &str = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae
 const TAKER_KEY: &str = "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d";
 const TAKER: &str = "0x70997970C51812dc3A010C7d01b50e0d17dc79C8";
 const SIGNER_KEY: &str = "0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a";
+/// Anvil's #0 and #2, by address.
+const DEPLOYER: &str = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266";
+const SIGNER: &str = "0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC";
+/// The maker vault's cap per day in the vault run: more than the suite locks in all.
+const VAULT_CAP: u128 = 500_000_000;
 /// Anvil's #3, a stranger.
 const STRANGER: &str = "0x90F79bf6EB2c4f870365E785982E1f101E93b906";
 
@@ -52,10 +59,10 @@ struct Node {
 }
 
 impl Node {
-    fn start(root: &Path) -> Self {
+    fn start(root: &Path, offset: u16) -> Self {
         let daemon = std::env::var("ELEMENTSD").unwrap_or_else(|_| "elementsd".into());
         let cli = std::env::var("ELEMENTS_CLI").unwrap_or_else(|_| "elements-cli".into());
-        let port = 40_000 + (std::process::id() % 20_000) as u16;
+        let port = 30_000 + (std::process::id() % 10_000) as u16 * 2 + offset;
         let dir = root.join("node");
         std::fs::create_dir_all(&dir).unwrap();
         let mut child = Command::new(daemon)
@@ -126,8 +133,8 @@ fn cast(args: &[&str]) -> String {
 }
 
 impl Evm {
-    fn start() -> Self {
-        let port = 45_000 + (std::process::id() % 15_000) as u16;
+    fn start(offset: u16) -> Self {
+        let port = 50_000 + (std::process::id() % 7_000) as u16 * 2 + offset;
         let url = format!("http://127.0.0.1:{port}");
         let child = Command::new("anvil")
             .args(["--port", &port.to_string(), "--silent"])
@@ -141,21 +148,38 @@ impl Evm {
             std::thread::sleep(Duration::from_millis(100));
         }
         cast(&["rpc", "anvil_mine", "0x834", "0x1", "--rpc-url", &url]);
-        let contracts = concat!(env!("CARGO_MANIFEST_DIR"), "/../../contracts/polygon");
-        let deploy = |args: &[&str]| -> EvmAddress {
-            let mut all = vec!["create", "--rpc-url", &url, "--private-key", DEPLOYER_KEY, "--broadcast", "--json"];
-            all.extend_from_slice(args);
-            let out = Command::new("forge").args(&all).current_dir(contracts).output().expect("forge");
-            assert!(out.status.success(), "forge create: {}", String::from_utf8_lossy(&out.stderr));
-            let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
-            EvmAddress::parse(v["deployedTo"].as_str().unwrap()).unwrap()
-        };
-        let token = deploy(&["src/testnet/StandInUSDT0.sol:StandInUSDT0"]);
-        let escrow =
-            deploy(&["src/Escrow.sol:Escrow", "--constructor-args", &token.to_string(), "1209600", "604800"]);
-        let evm = Evm { child, url, rpc, escrow, token };
+        let mut evm = Evm { child, url, rpc, escrow: EvmAddress::ZERO, token: EvmAddress::ZERO };
+        evm.token = evm.deploy(&["src/testnet/StandInUSDT0.sol:StandInUSDT0"]);
+        evm.escrow = evm.new_escrow();
         evm.finalize();
         evm
+    }
+
+    fn deploy(&self, args: &[&str]) -> EvmAddress {
+        let contracts = concat!(env!("CARGO_MANIFEST_DIR"), "/../../contracts/polygon");
+        let mut all = vec!["create", "--rpc-url", &self.url, "--private-key", DEPLOYER_KEY, "--broadcast", "--json"];
+        all.extend_from_slice(args);
+        let out = Command::new("forge").args(&all).current_dir(contracts).output().expect("forge");
+        assert!(out.status.success(), "forge create: {}", String::from_utf8_lossy(&out.stderr));
+        let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        EvmAddress::parse(v["deployedTo"].as_str().unwrap()).unwrap()
+    }
+
+    fn new_escrow(&self) -> EvmAddress {
+        self.deploy(&["src/Escrow.sol:Escrow", "--constructor-args", &self.token.to_string(), "1209600", "604800"])
+    }
+
+    /// A maker vault for `escrow`, owned by the deployer, which plays the maker's cold key.
+    fn new_vault(&self, escrow: &EvmAddress, operator: &str, cap: u128) -> EvmAddress {
+        self.deploy(&[
+            "src/MakerVault.sol:MakerVault",
+            "--constructor-args",
+            &escrow.to_string(),
+            DEPLOYER,
+            operator,
+            "86400",
+            &cap.to_string(),
+        ])
     }
 
     /// Mine past anvil's finality depth of 64 blocks, so what was just sent is in the finalized block the signer reads.
@@ -275,13 +299,23 @@ fn assert_failed(reply: Reply, containing: &str) {
 #[test]
 #[ignore = "needs elementsd and Foundry; see the module docs"]
 fn the_signer_process_resists_a_compromised_engine() {
-    let root = std::env::temp_dir().join(format!("liq2any-signer-{}", std::process::id()));
+    run(false);
+}
+
+#[test]
+#[ignore = "needs elementsd and Foundry; see the module docs"]
+fn the_signer_process_resists_a_compromised_engine_through_a_maker_vault() {
+    run(true);
+}
+
+fn run(with_vault: bool) {
+    let root = std::env::temp_dir().join(format!("liq2any-signer-{}-{with_vault}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     let private = root.join("private");
     std::fs::create_dir_all(&private).unwrap();
     std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o700)).unwrap();
 
-    let node = Node::start(&root);
+    let node = Node::start(&root, u16::from(with_vault));
     node.mine(1);
     let issued: serde_json::Value = serde_json::from_str(&node.rpc.call(&["issueasset", "1000", "0", "false"]).unwrap()).unwrap();
     let usdt_id = issued["asset"].as_str().unwrap().to_string();
@@ -296,8 +330,12 @@ fn the_signer_process_resists_a_compromised_engine() {
     let chain = Esplora::Node(node.rpc.clone());
     let genesis = BlockHash::from_str(&chain.genesis().unwrap()).unwrap();
 
-    let evm = Evm::start();
+    let evm = Evm::start(u16::from(with_vault));
     println!("anvil at {}: escrow {}, token {}", evm.url, evm.escrow, evm.token);
+    let vault = with_vault.then(|| evm.new_vault(&evm.escrow, SIGNER, VAULT_CAP));
+    if let Some(vault) = &vault {
+        println!("    through the maker vault at {vault}");
+    }
 
     // The signer's Polygon key is anvil's account #2, so it holds test ETH from the start.
     let keys = root.join("keys");
@@ -317,6 +355,7 @@ fn the_signer_process_resists_a_compromised_engine() {
             escrow: Some(evm.escrow.to_string()),
             token: Some(evm.token.to_string()),
             fees: Default::default(),
+            maker_vault: vault.map(|v| v.to_string()),
         },
         limits,
         regtest_assets: Some((usdt_id.clone(), lbtc_id.clone())),
@@ -359,6 +398,20 @@ fn the_signer_process_resists_a_compromised_engine() {
         "mainnet's USDT0",
     );
     refuses("mainnet", &Config { network: "mainnet".into(), regtest_assets: None, ..config.clone() }, "refusing to start");
+    if with_vault {
+        let with = |name: &str, vault: String, why: &str| {
+            let cfg = Config { polygon: PolygonConfig { maker_vault: Some(vault), ..config.polygon.clone() }, ..config.clone() };
+            refuses(name, &cfg, why);
+        };
+        with("vault-none", STRANGER.into(), "polygon.maker_vault");
+        let theirs = evm.new_vault(&evm.escrow, STRANGER, VAULT_CAP);
+        with("vault-operator", theirs.to_string(), "operator is");
+        let empty = evm.new_vault(&evm.escrow, SIGNER, 0);
+        with("vault-cap", empty.to_string(), "cap is zero");
+        let other = evm.new_escrow();
+        let elsewhere = evm.new_vault(&other, SIGNER, VAULT_CAP);
+        with("vault-escrow", elsewhere.to_string(), "not ours");
+    }
 
     let mut signer = SignerProcess::start(&config_path, &socket);
     let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
@@ -370,10 +423,20 @@ fn the_signer_process_resists_a_compromised_engine() {
 
     let mut client = Client::connect(&socket).unwrap();
     let Reply::Identity { liquid_address, polygon, .. } = client.call(&Call::Identity).unwrap() else { panic!() };
-    assert_eq!(polygon, "0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC", "anvil's account #2, from the key file");
+    match &vault {
+        Some(v) => assert_eq!(polygon, v.to_string(), "the vault is our address in swaps"),
+        None => assert_eq!(polygon, SIGNER, "anvil's account #2, from the key file"),
+    }
     node.fund(&liquid_address, 500_000, "bitcoin");
     node.fund(&liquid_address, 30 * LIQ_AMOUNT, &usdt_id);
-    evm.send(SIGNER_KEY, &evm.token, "faucet(uint256)", &["1000000000"]);
+    match &vault {
+        // The owner funds the vault with a plain transfer. The key keeps its test POL for gas.
+        Some(v) => {
+            evm.send(DEPLOYER_KEY, &evm.token, "faucet(uint256)", &["1000000000"]);
+            evm.send(DEPLOYER_KEY, &evm.token, "transfer(address,uint256)", &[&v.to_string(), "1000000000"]);
+        }
+        None => evm.send(SIGNER_KEY, &evm.token, "faucet(uint256)", &["1000000000"]),
+    }
     evm.send(TAKER_KEY, &evm.token, "faucet(uint256)", &["1000000000"]);
     evm.send(TAKER_KEY, &evm.token, "approve(address,uint256)", &[&evm.escrow.to_string(), &u128::MAX.to_string()]);
 
@@ -390,6 +453,7 @@ fn the_signer_process_resists_a_compromised_engine() {
         evm,
         genesis,
         maker_polygon: polygon,
+        vault,
         maker_script: Address::from_str(&liquid_address).unwrap().script_pubkey(),
         maker_address: liquid_address.clone(),
         taker,
@@ -398,6 +462,9 @@ fn the_signer_process_resists_a_compromised_engine() {
 
     bad_input(&mut client, &socket);
     let reserved = l2p_attacks(&world, &mut client);
+    if world.vault.is_some() {
+        vault_only(&world, &mut client);
+    }
     nonces(&world, &mut client);
     p2l_attacks(&world, &mut client, reserved);
     p2l_refund(&world, &mut client);
@@ -452,6 +519,8 @@ struct World {
     evm: Evm,
     genesis: BlockHash,
     maker_polygon: String,
+    /// The maker vault, in the vault run: then `maker_polygon` is the vault, and the key at `SIGNER` only signs.
+    vault: Option<EvmAddress>,
     maker_script: Script,
     maker_address: String,
     taker: Wallet,
@@ -699,11 +768,13 @@ fn l2p_attacks(world: &World, client: &mut Client) -> OutPoint {
     world.evm.block(TAKER, true);
     assert_refused(lock(client, &terms, dt, db), Refusal::Blocked);
     world.evm.block(TAKER, false);
-    // Not approved yet: nothing is signed, so no nonce is taken.
-    assert_failed(lock(client, &terms, dt, db), "ApproveEscrow");
-    let approve = client.call(&Call::ApproveEscrow).unwrap();
-    let approve_nonce = world.evm.publish(&approve);
-    println!("    ok: the escrow was approved, at nonce {approve_nonce}");
+    if world.vault.is_none() {
+        // Not approved yet: nothing is signed, so no nonce is taken.
+        assert_failed(lock(client, &terms, dt, db), "ApproveEscrow");
+        let approve = client.call(&Call::ApproveEscrow).unwrap();
+        let approve_nonce = world.evm.publish(&approve);
+        println!("    ok: the escrow was approved, at nonce {approve_nonce}");
+    }
 
     // Now everything is right. The signer signs, and doesn't send.
     let first = lock(client, &terms, dt, db);
@@ -717,7 +788,11 @@ fn l2p_attacks(world: &World, client: &mut Client) -> OutPoint {
     assert_refused(lock(client, &SwapTerms { gas_drop: 1, ..terms.clone() }, dt, db), Refusal::AlreadyLocked);
     println!("    ok: a retry is byte-identical, and different terms are refused");
     let raw = decode_signed(&from_hex(match &first { Reply::Polygon { raw, .. } => raw, _ => unreachable!() }).unwrap()).unwrap();
-    assert_eq!((raw.to, raw.value), (world.evm.escrow, 1_000_000_000_000_000), "to the escrow, carrying the gas drop");
+    assert_eq!(
+        (raw.to, raw.value),
+        (world.vault.unwrap_or(world.evm.escrow), 1_000_000_000_000_000),
+        "to the escrow, or the vault, carrying the gas drop"
+    );
 
     world.evm.publish(&first);
     let l = world.evm.lock(&ours);
@@ -762,9 +837,11 @@ fn l2p_attacks(world: &World, client: &mut Client) -> OutPoint {
 /// nothing else ever takes that nonce.
 fn nonces(world: &World, client: &mut Client) {
     println!("\n==> Polygon nonces");
-    // The escrow's approval was mined earlier: asking again gives the mined transaction back, and signs nothing new.
-    let Reply::Polygon { nonce: approved, .. } = client.call(&Call::ApproveEscrow).unwrap() else { panic!() };
-    assert_eq!(approved, 1, "the nonce it was mined at");
+    if world.vault.is_none() {
+        // The escrow's approval was mined earlier: asking again gives the mined transaction back, and signs nothing new.
+        let Reply::Polygon { nonce: approved, .. } = client.call(&Call::ApproveEscrow).unwrap() else { panic!() };
+        assert_eq!(approved, 1, "the nonce it was mined at");
+    }
     // A lock signed and not sent.
     let (_, point) = fresh_point();
     let terms = world.terms(Direction::L2P, point, world.chain.tip().unwrap() + 480, LIQ_AMOUNT, USDT0);
@@ -1062,6 +1139,27 @@ fn withdrawals(world: &World, config: &Config, root: &Path, private: &Path) {
     let (path, socket) = start("w", WithdrawTo { liquid: None, polygon: Some(cold.into()) });
     let _signer = SignerProcess::start(&path, &socket);
     let mut client = Client::connect(&socket).unwrap();
+    if world.vault.is_some() {
+        for amount in [None, Some(1)] {
+            assert_failed(
+                client.call(&Call::Withdraw { chain: Chain::Polygon, asset: Asset::Usdt, amount }).unwrap(),
+                "withdrawn by its owner",
+            );
+        }
+        println!("    ok: the vault's USDT0 can't be withdrawn by the hot key");
+    } else {
+        usdt0_withdrawals(world, &mut client, cold);
+    }
+    let pol = client.call(&Call::Withdraw { chain: Chain::Polygon, asset: Asset::Gas, amount: None }).unwrap();
+    world.evm.publish(&pol);
+    let key = EvmAddress::parse(SIGNER).unwrap();
+    let left = world.evm.rpc.balance(&key, "latest").unwrap();
+    assert!(left < 10_000_000_000_000_000, "nearly all the POL went: {left} wei left");
+    assert!(world.evm.rpc.balance(&EvmAddress::parse(cold).unwrap(), "latest").unwrap() > 9_000 * 1_000_000_000_000_000_000);
+    println!("    ok: and the POL, less this transfer's gas");
+}
+
+fn usdt0_withdrawals(world: &World, client: &mut Client, cold: &str) {
     let held = world.evm.token_balance(&world.maker_polygon);
     let some = client.call(&Call::Withdraw { chain: Chain::Polygon, asset: Asset::Usdt, amount: Some(u128::from(USDT0)) }).unwrap();
     world.evm.publish(&some);
@@ -1073,10 +1171,46 @@ fn withdrawals(world: &World, config: &Config, root: &Path, private: &Path) {
     assert_eq!(world.evm.token_balance(cold), held, "all of it reached the configured address");
     assert_eq!(world.evm.token_balance(&world.maker_polygon), 0);
     println!("    ok: USDT0, some then all, went to the configured address, though a request named another");
-    let pol = client.call(&Call::Withdraw { chain: Chain::Polygon, asset: Asset::Gas, amount: None }).unwrap();
-    world.evm.publish(&pol);
-    let left = world.evm.rpc.balance(&world.maker(), "latest").unwrap();
-    assert!(left < 10_000_000_000_000_000, "nearly all the POL went: {left} wei left");
-    assert!(world.evm.rpc.balance(&EvmAddress::parse(cold).unwrap(), "latest").unwrap() > 9_000 * 1_000_000_000_000_000_000);
-    println!("    ok: and the POL, less this transfer's gas");
+}
+
+/// What only the vault run checks: nothing to approve, the capacity the cap leaves, and a lock over the cap or after the key
+/// is rotated out, which the signer's own simulation refuses before taking a nonce.
+fn vault_only(world: &World, client: &mut Client) {
+    println!("\n==> Through the maker vault");
+    let vault = world.vault.unwrap();
+    let pending = |client: &mut Client| {
+        let Reply::PolygonPending(pending) = client.call(&Call::PendingPolygon).unwrap() else { panic!() };
+        pending.len()
+    };
+    let pending_before = pending(client);
+    assert_failed(client.call(&Call::ApproveEscrow).unwrap(), "nothing to approve");
+    let Reply::Balances { polygon_usdt, polygon_allowance, .. } = client.call(&Call::Balances).unwrap() else { panic!() };
+    let held = world.evm.rpc.token_balance(&world.evm.token, &vault, "latest").unwrap();
+    assert_eq!((u128::from(polygon_usdt), polygon_allowance), (held, u128::MAX), "the vault's USDT0, and no approval to make");
+    let used = world.evm.rpc.vault_state(&vault).unwrap().window_used;
+    assert!(used > 0, "the locks above counted against the cap");
+    let capacity = |client: &mut Client| {
+        let Reply::Capacity { polygon_units, .. } = client.call(&Call::Capacity).unwrap() else { panic!() };
+        polygon_units
+    };
+    assert_eq!(u128::from(capacity(client)), VAULT_CAP - used, "the cap left, not the balance, limits what we offer");
+    let set = |operator: &str, cap: u128| {
+        world.evm.send(DEPLOYER_KEY, &vault, "setOperator(address,uint64,uint128)", &[operator, "86400", &cap.to_string()]);
+    };
+    set(SIGNER, used + 5);
+    assert_eq!(capacity(client), 5);
+    println!("    ok: capacity is the USDT0 held or the cap left, whichever is less");
+
+    let (_, point) = fresh_point();
+    let terms = world.terms(Direction::L2P, point, world.chain.tip().unwrap() + 480, LIQ_AMOUNT, USDT0);
+    l2p_ready(world, client, &terms);
+    let (time, block) = world.evm.finalized();
+    let lock = Call::LockPolygon { terms, deadline_time: time + 3 * 3_600, deadline_block: block + 11_000 };
+    assert_failed(client.call(&lock).unwrap(), "would fail now");
+    println!("    ok: a lock over the cap isn't signed");
+    set(STRANGER, VAULT_CAP);
+    assert_failed(client.call(&lock).unwrap(), "would fail now");
+    println!("    ok: nor once the owner has rotated our key out");
+    set(SIGNER, VAULT_CAP);
+    assert_eq!(pending(client), pending_before, "nothing signed, so no nonce taken");
 }
