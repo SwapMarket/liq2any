@@ -1,0 +1,22 @@
+[Unit]
+Description=liq2any daemon for maker %i
+After=liq2any-signer@%i.service
+Wants=liq2any-signer@%i.service
+
+[Service]
+User=liq2any
+Group=liq2any
+WorkingDirectory=/var/lib/liq2any/%i
+ExecStart=/opt/liq2any/liq2any-maker /var/lib/liq2any/%i/maker.json
+# It stops if the signer isn't up yet, and tries again.
+Restart=always
+RestartSec=15
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/liq2any/%i
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

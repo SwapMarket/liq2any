@@ -1478,8 +1478,14 @@ pub fn run(config_path: &Path) -> Result<(), String> {
     };
     // Public addresses only, so an operator with new keys knows where to send funds.
     if let Ok(mut guard) = signer.lock() {
+        let key = guard.me;
         if let Reply::Identity { liquid_address, polygon, .. } = guard.handle(&Call::Identity) {
-            println!("signer ready. To fund it: Liquid {liquid_address}, Polygon {polygon}");
+            if polygon == key.to_string() {
+                println!("signer ready. To fund it: Liquid {liquid_address}, Polygon {polygon}");
+            } else {
+                // With a maker vault, its owner funds the vault, and the key needs only POL, for gas and gas drops.
+                println!("signer ready. To fund it: Liquid {liquid_address}, Polygon {polygon} (the vault), POL for gas {key}");
+            }
         }
     }
     let _ = std::fs::remove_file(&cfg.socket);

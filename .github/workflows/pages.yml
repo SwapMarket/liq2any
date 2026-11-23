@@ -1,0 +1,141 @@
+# Builds the taker client from source, tests it, and publishes it to https://swapmarket.github.io/liq2any/.
+# Actions are pinned to exact commits, and the site's JavaScript has no build step. The WebAssembly and the stamped index.html are
+# built in a pinned container, twice on two machines, so anyone can rebuild a published commit and get the same bytes.
+name: Deploy the client
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - client/**
+      - scripts/build-page.sh
+      - contracts/swapkey/**
+      - shared/chain/**
+      - shared/rfq/**
+      - contracts/polygon/deployments/**
+      - .github/workflows/pages.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pages
+  # A new push makes any deploy still running pointless.
+  cancel-in-progress: true
+
+env:
+  RUST_VERSION: 1.99.1
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+      - name: Test how orders fill, the networks, and that swap records are never overwritten
+        run: node --test client/test/*.test.mjs
+      # A marker saved only when this job succeeds, so a failure can't be skipped on the next run. The key covers everything these tests build.
+      - name: Skip the native tests if they already passed on this code
+        id: passed
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: client/wasm/.native-tests-passed
+          key: native-tests-${{ runner.os }}-${{ env.RUST_VERSION }}-${{ hashFiles('client/wasm/**', 'contracts/swapkey/**', 'shared/chain/**', 'shared/rfq/**') }}
+      - name: Install the Rust toolchain
+        if: steps.passed.outputs.cache-hit != 'true'
+        run: |
+          rustup toolchain install "$RUST_VERSION" --profile minimal
+          rustup default "$RUST_VERSION"
+      - name: Test the WebAssembly's exports natively (the calldata checks against cast skip without Foundry)
+        if: steps.passed.outputs.cache-hit != 'true'
+        working-directory: client/wasm
+        run: |
+          cargo test --locked
+          touch .native-tests-passed
+
+  # The page is built in a pinned container (client/reproducible), so anyone can rebuild a published commit and get the same bytes:
+  # scripts/check-page.sh compares the live site with a rebuild. The toolchain image is kept between runs, keyed by its recipe.
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Reuse the toolchain image
+        id: image
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: /tmp/page-builder.tar
+          key: page-builder-${{ hashFiles('client/reproducible/Dockerfile', 'client/reproducible/build-inside.sh', 'client/wasm/Cargo.lock') }}
+      - name: Load it
+        if: steps.image.outputs.cache-hit == 'true'
+        run: docker load -i /tmp/page-builder.tar
+      - name: Build the page, as anyone can
+        run: scripts/build-page.sh "$GITHUB_SHA" site
+      - name: Keep the toolchain image
+        if: steps.image.outputs.cache-hit != 'true'
+        run: docker save -o /tmp/page-builder.tar $(docker images --format '{{.Repository}}:{{.Tag}}' liq2any-page-builder)
+      - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: site
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: sums
+          path: site/SHA256SUMS
+
+  # The same build on another machine, at the same time. Nothing is published unless the two agree byte for byte. Without a cached
+  # image it builds its own, so the two builds then share nothing but the source.
+  rebuild:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Reuse the toolchain image
+        id: image
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: /tmp/page-builder.tar
+          key: page-builder-${{ hashFiles('client/reproducible/Dockerfile', 'client/reproducible/build-inside.sh', 'client/wasm/Cargo.lock') }}
+      - name: Load it
+        if: steps.image.outputs.cache-hit == 'true'
+        run: docker load -i /tmp/page-builder.tar
+      - name: Build again
+        run: scripts/build-page.sh "$GITHUB_SHA" site
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: sums-rebuild
+          path: site/SHA256SUMS
+
+  compare:
+    runs-on: ubuntu-24.04
+    needs: [build, rebuild]
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: sums
+          path: first
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: sums-rebuild
+          path: second
+      - name: Compare
+        run: diff first/SHA256SUMS second/SHA256SUMS && echo "the two builds are identical"
+
+  deploy:
+    needs: [test, build, compare]
+    runs-on: ubuntu-24.04
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1

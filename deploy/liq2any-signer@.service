@@ -1,0 +1,24 @@
+[Unit]
+Description=liq2any signer for maker %i
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=liq2any
+Group=liq2any
+WorkingDirectory=/var/lib/liq2any/%i
+# Makers on one machine share its IP, so their starts are two seconds apart: each takes this lock and holds it that long.
+# Each maker starts after its own signer, so it follows. `+` runs this as root, outside the sandbox, to reach /run.
+ExecStartPre=+/usr/bin/flock /run/liq2any-start.lock /bin/sleep 2
+ExecStart=/opt/liq2any/liq2any-signer /var/lib/liq2any/%i/signer.json
+Restart=always
+RestartSec=10
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/liq2any/%i
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
