@@ -376,12 +376,12 @@ impl Rpc {
         quantity_u64(&self.call("eth_estimateGas", json!([tx]))?)
     }
 
-    /// Sends a signed transaction, returning its hash. A node that already has it may answer "already known", which counts as
+    /// Sends a signed transaction, returning its hash. A node that already has it may answer "already known" (Bor, geth) or "already imported" (anvil), which counts as
     /// sent: the hash is the transaction's own.
     pub fn send_raw(&self, raw: &[u8]) -> Res<[u8; 32]> {
         match self.call("eth_sendRawTransaction", json!([format!("0x{}", to_hex(raw))])) {
             Ok(_) => Ok(crate::evm::tx_hash(raw)),
-            Err(e) if e.contains("already known") || e.contains("known transaction") => Ok(crate::evm::tx_hash(raw)),
+            Err(e) if e.contains("already known") || e.contains("known transaction") || e.contains("already imported") => Ok(crate::evm::tx_hash(raw)),
             Err(e) => Err(e),
         }
     }
