@@ -8,6 +8,7 @@ so nothing Cancun-specific is relied on).
 | `src/Escrow.sol` | Locks, claims, refunds, releases and extensions. Immutable: no owner, no upgrade, no pause, no fee. |
 | `src/SwapVault.sol` | Holds one swap's coins. `Escrow` deploys an EIP-1167 proxy of it per swap with CREATE2, at `vaultOf(id)`. |
 | `src/TokenCall.sol` | ERC-20 calls that fail loudly |
+| `src/MakerVault.sol` | A maker's float: a cold owner withdraws, a hot operator locks up to a cap per window (decision P9, design section 2.6). Optional; for mainnet. |
 | `test/vectors.txt` | Shared vectors from `scripts/polygon-vectors.py`: a pure-Python secp256k1 and keccak-256 |
 
 ## Tests
@@ -42,6 +43,16 @@ Dollars at 283.8 gwei and POL at $0.0757.
 | `lock` with a gas drop, maker's short leg | 251,604 | $0.0054 |
 | `claim`, to a recipient new to USDT0 | 106,888 | $0.0023 |
 
+Through a maker vault, measured inside the fork test with real USDT0 (2026-11-23), so without the 21,000 base cost and calldata
+that the figures above include:
+
+| Call | Gas |
+|---|---|
+| `MakerVault.lock` with a gas drop, the vault's first lock | 253,463 |
+| `MakerVault.lock` with no gas drop | 233,559 |
+
+The vault approves the escrow inside the lock, so the separate `approve` above isn't needed.
+
 ## Deploying
 
 The constructor takes the token and the block counterparts of 14 days and 7 days for the network's block time:
@@ -50,6 +61,9 @@ The constructor takes the token and the block counterparts of 14 days and 7 days
 - Amoy, 1.0 s blocks: `1209600 604800`.
 
 The user deploys mainnet, once, and it never changes (decision P3).
+
+A maker vault takes the escrow, the cold owner, the hot operator, the window in seconds and the cap in token units, for example
+`MakerVault(escrow, owner, operator, 86400, 1000e6)`. The owner then funds it with a plain USDT0 transfer.
 
 ## Amoy
 

@@ -16,6 +16,7 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent / "contracts" / "polygon"
 ESCROW = "src/Escrow.sol"
 VAULT = "src/SwapVault.sol"
 CALL = "src/TokenCall.sol"
+MAKER = "src/MakerVault.sol"
 
 # Mutations that can't change behaviour, with the reason. They are run and reported, but don't fail the script.
 EQUIVALENT = {
@@ -81,6 +82,26 @@ MUTATIONS = [
     (VAULT, "if (msg.sender != escrow) revert OnlyEscrow();", ""),
     (CALL, "if (!ok) revert TokenCallFailed();\n        if (ret.length", "if (ret.length"),
     (CALL, "if (ret.length != 0 && (ret.length != 32 || abi.decode(ret, (uint256)) != 1)) revert TokenCallFailed();", ""),
+    # The maker vault (decision P9).
+    (MAKER, "if (address(escrow_).code.length == 0 || owner_ == address(0)) revert BadSetting();",
+     "if (address(escrow_).code.length == 0) revert BadSetting();"),
+    (MAKER, "if (address(escrow_).code.length == 0 || owner_", "if (owner_"),
+    (MAKER, "if (msg.sender != owner) revert NotOwner();", ""),
+    (MAKER, "if (msg.sender != operator) revert NotOperator();", ""),
+    (MAKER, "if (to == address(0)) revert BadSetting();", ""),
+    (MAKER, "if (windowSecs_ == 0) revert BadSetting();", ""),
+    (MAKER, "(windowStart, windowUsed) = afterLock(amount);", "afterLock(amount);"),
+    (MAKER, "token.approve(address(escrow), amount);", "token.approve(address(escrow), type(uint256).max);"),
+    (MAKER, "deadlineBlock, false, gasTo)", "deadlineBlock, true, gasTo)"),
+    (MAKER, "escrow.lock{value: msg.value}(", "escrow.lock{value: 0}("),
+    (MAKER, "if (block.timestamp >= uint256(windowStart) + windowSecs) {", "if (block.timestamp > uint256(windowStart) + windowSecs) {"),
+    (MAKER, "(start, used) = (uint64(block.timestamp), 0);", "(start, used) = (windowStart, 0);"),
+    (MAKER, "(start, used) = (windowStart, windowUsed);", "(start, used) = (windowStart, 0);"),
+    (MAKER, "if (used > windowCap || amount > windowCap - used) revert OverCap();", "if (amount > windowCap - used) revert OverCap();"),
+    (MAKER, "if (used > windowCap || amount > windowCap - used) revert OverCap();", "if (amount > windowCap) revert OverCap();"),
+    (MAKER, "used += amount;", ""),
+    (MAKER, "escrow.release(id);", ""),
+    (MAKER, "escrow.extend(id, newTime, newBlock);", ""),
 ]
 
 

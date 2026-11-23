@@ -4,6 +4,7 @@ pragma solidity 0.8.30;
 import {Test} from "forge-std/Test.sol";
 import {Escrow} from "../src/Escrow.sol";
 import {TokenCall} from "../src/TokenCall.sol";
+import {MakerVault, IEscrow} from "../src/MakerVault.sol";
 
 interface IUSDT0 {
     function balanceOf(address) external view returns (uint256);
@@ -181,5 +182,58 @@ contract EscrowForkTest is Test {
         escrow.claim(a, sa);
         assertEq(USDT0.balanceOf(taker), before + 100e6);
         assertTrue(USDT0.isBlocked(taker));
+    }
+
+    // ---- The maker vault (decision P9) ----
+
+    function makerVault() internal returns (MakerVault v) {
+        v = new MakerVault(IEscrow(address(escrow)), makeAddr("owner"), maker, 1 days, 500e6);
+        vm.prank(WHALE);
+        USDT0.transfer(address(v), 1_000e6);
+    }
+
+    /// USDT0's `approve` is set exactly per lock and used up by it, so no allowance stays between locks.
+    function test_fork_maker_vault_locks_and_is_refunded_with_real_usdt0() public {
+        MakerVault v = makerVault();
+        (uint256 t, bytes32 s) = secret(10);
+        vm.prank(maker);
+        bytes32 id =
+            v.lock(vm.addr(t), taker, 300e6, uint64(block.timestamp + 3 hours), uint64(block.number + 7200), taker);
+        assertEq(USDT0.balanceOf(address(v)), 700e6);
+        (uint256 t2,) = secret(11);
+        vm.prank(maker);
+        bytes32 id2 =
+            v.lock(vm.addr(t2), taker, 200e6, uint64(block.timestamp + 1), uint64(block.number + 2), address(0));
+        (uint256 t3,) = secret(12);
+        vm.prank(maker);
+        vm.expectRevert(MakerVault.OverCap.selector);
+        v.lock(vm.addr(t3), taker, 1, uint64(block.timestamp + 3 hours), uint64(block.number + 7200), address(0));
+        escrow.claim(id, s);
+        assertEq(USDT0.balanceOf(taker), 1_300e6);
+        vm.warp(block.timestamp + 2);
+        vm.roll(block.number + 2);
+        escrow.refund(id2);
+        assertEq(USDT0.balanceOf(address(v)), 700e6, "the refund returns to the vault");
+    }
+
+    /// The vault is one address Tether can block: then it can neither lock nor withdraw, and its coins can be burned. Open
+    /// swaps, each in its own swap vault, still settle.
+    function test_fork_tether_blocks_the_maker_vault() public {
+        MakerVault v = makerVault();
+        (uint256 t, bytes32 s) = secret(13);
+        vm.prank(maker);
+        bytes32 id = v.lock(
+            vm.addr(t), taker, 100e6, uint64(block.timestamp + 3 hours), uint64(block.number + 7200), address(0)
+        );
+        vm.prank(TETHER_SAFE);
+        USDT0.addToBlockedList(address(v));
+        vm.prank(maker);
+        vm.expectRevert(TokenCall.TokenCallFailed.selector);
+        v.lock(vm.addr(t + 1), taker, 1e6, uint64(block.timestamp + 3 hours), uint64(block.number + 7200), address(0));
+        vm.prank(makeAddr("owner"));
+        vm.expectRevert(TokenCall.TokenCallFailed.selector);
+        v.withdraw(makeAddr("owner"), 1e6);
+        escrow.claim(id, s);
+        assertEq(USDT0.balanceOf(taker), 1_100e6, "the open swap still pays");
     }
 }

@@ -135,10 +135,25 @@ taker's own wallet. If the escrow sent one, a failed second hop would be refunde
 
 ### 2.6 Maker vault (decision P9)
 
-liq2sol's maker vault (its D6) lets a hot operator key lock up to a cap per window, while a cold owner key alone can withdraw. The
-same can be added here as a separate contract, `MakerVault`, which calls `Escrow.lock` with `initiator` set to the vault. It
-brings back one blockable address for the maker's float, which is the maker's own risk to take. Accepted (P9) for mainnet, not
-needed for the first testnet release.
+liq2sol's maker vault (its D6) lets a hot operator key lock up to a cap per window, while a cold owner key alone can withdraw. Here
+it is `contracts/polygon/src/MakerVault.sol`, one per maker, deployed by the maker against one escrow. Accepted (P9) for mainnet,
+not needed for the first testnet release.
+
+- **The vault is the maker's Polygon address in both directions** (`maker_polygon` in the terms). It is the initiator of the
+  maker's L→P locks, so refunds return to it, and the recipient of takers' P→L locks, so claims pay into it, not to the hot key.
+- **Owner (cold), fixed at deployment:** `withdraw(to, amount)` and `setOperator(operator, windowSecs, windowCap)`. A zero
+  operator stops all locking.
+- **Operator (hot):** `lock(lockAddress, recipient, amount, deadlineTime, deadlineBlock, gasTo)`, always the short leg, with any
+  POL sent passed on as the gas drop; and `release(id)` and `extend(id, …)`, passed on to the escrow, which accepts them only
+  from a lock's recipient. Claims and refunds need no vault: anyone may send them.
+- **The cap:** at most `windowCap` locked per `windowSecs`. A window starts at the first lock after the last one ended, as in
+  liq2sol. Refunds don't give the cap back. The window is in seconds, not blocks: a cap needn't follow a Polygon halt.
+- Each lock approves the escrow for exactly its amount, which the lock uses up, so no allowance stays between locks.
+
+The operator can still lock up to the cap to a recipient it controls and claim it, so **the cap, not the key separation, limits a
+stolen hot key.** The vault is one address Tether can block, which stops its locks and withdrawals while open swaps, each in its
+own swap vault, still settle. So the maker keeps its balance near operating needs. The vault has no other functions, and holds
+no POL: the operator pays gas and gas drops from its own.
 
 ### 2.7 Tests
 

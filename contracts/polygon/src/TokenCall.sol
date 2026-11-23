@@ -15,6 +15,10 @@ library TokenCall {
         _call(token, abi.encodeWithSelector(0x23b872dd, from, to, amount));
     }
 
+    function approve(address token, address spender, uint256 amount) internal {
+        _call(token, abi.encodeWithSelector(0x095ea7b3, spender, amount));
+    }
+
     function balanceOf(address token, address who) internal view returns (uint256) {
         (bool ok, bytes memory data) = token.staticcall(abi.encodeWithSelector(0x70a08231, who));
         if (!ok || data.length < 32) revert TokenCallFailed();
