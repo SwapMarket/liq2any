@@ -9,6 +9,12 @@
 //! `cargo build` first, because this starts the signer binary from the same workspace. Needs Foundry (`anvil`, `forge`,
 //! `cast`) on the PATH. Anvil mines a block a second and finalizes two behind the head, close to Polygon's own finality.
 //! Test networks only: anvil's well-known keys hold nothing real. `SCENARIO` runs a subset.
+//!
+//! `POLYGON=amoy` runs it against Polygon Amoy instead, with the escrow and stand-in token in
+//! `contracts/polygon/deployments/amoy.json`. The maker's and taker's test keys are made on the first run and kept in `.keys/`
+//! (ignored by git), and topped up with POL from the Amoy deployer's key, `contracts/polygon/.keys/amoy-deployer.json`. A run
+//! costs about 0.45 POL. Amoy can't be halted or hurried, so the finality stall runs only on anvil, and waits for a deadline
+//! are real ones.
 
 use std::collections::{HashMap, HashSet};
 use std::os::unix::fs::PermissionsExt;
@@ -16,7 +22,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use liq2any_chain::esplora::{build_confidential_pay, Esplora, Rpc};
@@ -29,7 +35,7 @@ use liq2any_chain::polygon::{lock_id, Lock, Rpc as PolygonRpc, State as LockStat
 use liq2any_chain::swap::{answer_claim, taker_fee_address, EarlyRefund, TakerClaim};
 use liq2any_maker::rfq::{load_keys, PairConfig, RfqConfig};
 use liq2any_maker::{accept, Config, Details, PolygonSources};
-use liq2any_maker_core::engine::{Action, Config as EngineConfig, Direction, Outcome, State, Terms};
+use liq2any_maker_core::engine::{blocks_for, Action, Config as EngineConfig, Direction, Outcome, State, Terms};
 use liq2any_maker_core::policy::Limits;
 use liq2any_maker_core::store::Store;
 use liq2any_maker_core::LockPoint;
@@ -68,12 +74,65 @@ const L2P_SECS: u64 = 90;
 const P2L_GATE_SECS: u64 = 120;
 type Res<T> = Result<T, String>;
 
-/// Anvil's default accounts: #0 deploys and blocks (Tether's role on the stand-in), #1 is the taker, #2 the signer's key.
-const DEPLOYER_KEY: &str = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
-const TAKER_KEY: &str = "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d";
-const TAKER: &str = "0x70997970C51812dc3A010C7d01b50e0d17dc79C8";
-const SIGNER_KEY: &str = "0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a";
 const ZERO: &str = "0x0000000000000000000000000000000000000000";
+const AMOY_RPC: &str = "https://polygon-amoy-bor-rpc.publicnode.com";
+const AMOY_SECOND_RPC: &str = "https://polygon-amoy.drpc.org";
+/// POL each test key is topped up to on Amoy, in wei.
+const AMOY_MAKER_POL: u128 = 300_000_000_000_000_000;
+const AMOY_TAKER_POL: u128 = 200_000_000_000_000_000;
+
+/// The Polygon accounts. On anvil, its well-known ones: #0 deploys and blocks (Tether's role on the stand-in), #1 is the
+/// taker, #2 the signer's key. On Amoy, the deployer's key and two test keys of our own.
+struct Accounts {
+    deployer_key: String,
+    taker_key: String,
+    taker: EvmAddress,
+    maker_key: String,
+    maker: EvmAddress,
+}
+
+static ACCOUNTS: OnceLock<Accounts> = OnceLock::new();
+
+fn accounts() -> &'static Accounts {
+    ACCOUNTS.get().expect("accounts are set up first")
+}
+
+fn amoy() -> bool {
+    std::env::var("POLYGON").is_ok_and(|v| v == "amoy")
+}
+
+fn address_of(key: &str) -> EvmAddress {
+    EvmAddress::parse(&cast(&["wallet", "address", "--private-key", key]).unwrap()).unwrap()
+}
+
+fn anvil_accounts() -> Accounts {
+    let deployer_key = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80".to_string();
+    let taker_key = "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d".to_string();
+    let maker_key = "0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a".to_string();
+    Accounts { taker: address_of(&taker_key), maker: address_of(&maker_key), deployer_key, taker_key, maker_key }
+}
+
+/// A test key kept in `.keys/`, made on first use.
+fn kept_key(name: &str) -> String {
+    let dir = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../.keys"));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let path = dir.join(name);
+    if !path.exists() {
+        std::fs::write(&path, format!("0x{}\n", msg::hex(&random32().unwrap()))).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    std::fs::read_to_string(&path).unwrap().trim().to_string()
+}
+
+fn amoy_accounts() -> Accounts {
+    let file = concat!(env!("CARGO_MANIFEST_DIR"), "/../../contracts/polygon/.keys/amoy-deployer.json");
+    let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(file).expect("the Amoy deployer's key")).unwrap();
+    let deployer_key = v[0]["private_key"].as_str().expect("private_key").to_string();
+    let taker_key = kept_key("e2e-amoy-taker.key");
+    let maker_key = kept_key("e2e-amoy-maker.key");
+    Accounts { taker: address_of(&taker_key), maker: address_of(&maker_key), deployer_key, taker_key, maker_key }
+}
 
 fn check(condition: bool, what: &str) -> Res<()> {
     if condition {
@@ -206,6 +265,8 @@ impl Drop for Node {
 struct Miner {
     on: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
+    /// Held while a block is being mined, so a halt can wait for one already started.
+    busy: Arc<Mutex<()>>,
     handle: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -213,20 +274,26 @@ impl Miner {
     fn start(rpc: Rpc) -> Self {
         let on = Arc::new(AtomicBool::new(true));
         let stop = Arc::new(AtomicBool::new(false));
-        let (o, s) = (on.clone(), stop.clone());
+        let busy = Arc::new(Mutex::new(()));
+        let (o, s, b) = (on.clone(), stop.clone(), busy.clone());
         let handle = std::thread::spawn(move || {
             while !s.load(Ordering::SeqCst) {
-                if o.load(Ordering::SeqCst) {
-                    mine_with(&rpc, 1);
+                {
+                    let _mining = b.lock().unwrap();
+                    if o.load(Ordering::SeqCst) {
+                        mine_with(&rpc, 1);
+                    }
                 }
                 std::thread::sleep(Duration::from_secs(3));
             }
         });
-        Self { on, stop, handle: Some(handle) }
+        Self { on, stop, busy, handle: Some(handle) }
     }
 
+    /// Stop mining, once any block already started is done: one mined after a rollback would put back what it removed.
     fn halt(&self) {
         self.on.store(false, Ordering::SeqCst);
+        drop(self.busy.lock().unwrap());
     }
 
     fn resume(&self) {
@@ -262,17 +329,21 @@ fn cast(args: &[&str]) -> Res<String> {
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
-/// A local EVM chain with the escrow and stand-in token deployed, mining a block a second, with 2,100 blocks of history
-/// one second apart so the daemon can measure the block time at once.
+/// The Polygon side: a local anvil chain, or Amoy.
 struct Evm {
-    child: Child,
+    /// Anvil's process. None on Amoy, which can't be halted or hurried.
+    child: Option<Child>,
     url: String,
     rpc: PolygonRpc,
     escrow: EvmAddress,
     token: EvmAddress,
+    /// The measured time per block, as the daemon measures it, for deadlines on the block clock.
+    block_ms: u64,
 }
 
 impl Evm {
+    /// A local EVM chain with the escrow and stand-in token deployed, mining a block a second, with 2,100 blocks of history
+    /// one second apart so the daemon can measure the block time at once.
     fn start() -> Self {
         let port = 45_000 + (std::process::id() % 15_000) as u16;
         let url = format!("http://127.0.0.1:{port}");
@@ -290,8 +361,9 @@ impl Evm {
         }
         cast(&["rpc", "anvil_mine", "0x834", "0x1", "--rpc-url", &url]).unwrap();
         let contracts = concat!(env!("CARGO_MANIFEST_DIR"), "/../../contracts/polygon");
+        let deployer = &accounts().deployer_key;
         let deploy = |args: &[&str]| -> EvmAddress {
-            let mut all = vec!["create", "--rpc-url", &url, "--private-key", DEPLOYER_KEY, "--broadcast", "--json"];
+            let mut all = vec!["create", "--rpc-url", &url, "--private-key", deployer, "--broadcast", "--json"];
             all.extend_from_slice(args);
             let out = Command::new("forge").args(&all).current_dir(contracts).output().expect("forge");
             assert!(out.status.success(), "forge create: {}", String::from_utf8_lossy(&out.stderr));
@@ -300,7 +372,34 @@ impl Evm {
         };
         let token = deploy(&["src/testnet/StandInUSDT0.sol:StandInUSDT0"]);
         let escrow = deploy(&["src/Escrow.sol:Escrow", "--constructor-args", &token.to_string(), "1209600", "604800"]);
-        Evm { child, url, rpc, escrow, token }
+        Evm { child: Some(child), url, rpc, escrow, token, block_ms: 1_000 }
+    }
+
+    /// Amoy, with the contracts already deployed there.
+    fn amoy() -> Self {
+        let file = concat!(env!("CARGO_MANIFEST_DIR"), "/../../contracts/polygon/deployments/amoy.json");
+        let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(file).unwrap()).unwrap();
+        let at = |k: &str| EvmAddress::parse(v[k].as_str().unwrap()).unwrap();
+        let rpc = PolygonRpc::new(AMOY_RPC);
+        assert_eq!(rpc.chain_id().unwrap(), 80_002, "Amoy, and never mainnet");
+        let f = rpc.block("finalized").unwrap();
+        let past = rpc.block_number_at(f.number - 2_000).unwrap();
+        let block_ms = (f.time - past.time) * 1_000 / (f.number - past.number);
+        Evm { child: None, url: AMOY_RPC.into(), rpc, escrow: at("escrow"), token: at("token"), block_ms }
+    }
+
+    fn public(&self) -> bool {
+        self.child.is_none()
+    }
+
+    /// Blocks for `secs` of time at the measured block time, as a lock's block deadline counts them.
+    fn blocks(&self, secs: u64) -> u64 {
+        blocks_for(secs, self.block_ms)
+    }
+
+    /// Send POL.
+    fn pay(&self, key: &str, to: &EvmAddress, wei: u128) -> Res<()> {
+        cast(&["send", "--rpc-url", &self.url, "--private-key", key, &to.to_string(), "--value", &wei.to_string()]).map(|_| ())
     }
 
     fn send(&self, key: &str, to: &EvmAddress, sig: &str, args: &[&str]) -> Res<()> {
@@ -334,29 +433,64 @@ impl Evm {
 
     fn block(&self, who: &EvmAddress, on: bool) -> Res<()> {
         let sig = if on { "addToBlockedList(address)" } else { "removeFromBlockedList(address)" };
-        self.send(DEPLOYER_KEY, &self.token, sig, &[&who.to_string()])
+        self.send(&accounts().deployer_key, &self.token, sig, &[&who.to_string()])
     }
 
-    /// Stop making blocks, as in a Polygon halt, or start again.
+    /// Stop making blocks, as in a Polygon halt, or start again. Only anvil can.
     fn halt(&self, on: bool) -> Res<()> {
+        if self.public() {
+            return if on { Err("a public chain can't be halted".into()) } else { Ok(()) };
+        }
         cast(&["rpc", "evm_setIntervalMining", if on { "0" } else { "1" }, "--rpc-url", &self.url]).map(|_| ())
     }
 
-    /// Move both clocks on by `secs`, one block a second, so the measured block time stays the same.
-    fn warp(&self, secs: u64) -> Res<()> {
-        cast(&["rpc", "anvil_mine", &format!("0x{secs:x}"), "0x1", "--rpc-url", &self.url]).map(|_| ())
+    /// Until the head is past both deadlines. Anvil gets there at once, one block a second, so the measured block time stays
+    /// the same. Amoy is waited for.
+    fn pass(&self, time: u64, block: u64) -> Res<()> {
+        let (now, number) = self.now()?;
+        if !self.public() {
+            let blocks = time.saturating_sub(now).max(block.saturating_sub(number)) + 1;
+            return cast(&["rpc", "anvil_mine", &format!("0x{blocks:x}"), "0x1", "--rpc-url", &self.url]).map(|_| ());
+        }
+        println!("    (waiting {}s for Amoy to pass a deadline)", time.saturating_sub(now));
+        let start = Instant::now();
+        loop {
+            let (now, number) = self.now()?;
+            if now > time && number > block {
+                return Ok(());
+            }
+            if start.elapsed() > Duration::from_secs(3_600) {
+                return Err("Amoy never passed the deadline".into());
+            }
+            std::thread::sleep(Duration::from_secs(3));
+        }
     }
 }
 
 impl Drop for Evm {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
     }
 }
 
 fn taker() -> EvmAddress {
-    EvmAddress::parse(TAKER).unwrap()
+    accounts().taker
+}
+
+fn taker_str() -> String {
+    taker().checksummed()
+}
+
+/// The address with one letter's case flipped, so its checksum is wrong.
+fn bad_checksum(address: &EvmAddress) -> Option<String> {
+    let good = address.checksummed();
+    let at = good.char_indices().skip(2).find(|(_, c)| c.is_ascii_alphabetic())?.0;
+    let mut bad: Vec<char> = good.chars().collect();
+    bad[at] = if bad[at].is_ascii_uppercase() { bad[at].to_ascii_lowercase() } else { bad[at].to_ascii_uppercase() };
+    Some(bad.into_iter().collect())
 }
 
 fn lock_address(point: &LockPoint) -> EvmAddress {
@@ -488,23 +622,23 @@ impl World {
             recipient.to_string(),
             amount.to_string(),
             (time + secs).to_string(),
-            (block + secs).to_string(),
+            (block + self.evm.blocks(secs)).to_string(),
             "true".into(),
             ZERO.into(),
         ];
         let args: Vec<&str> = args.iter().map(String::as_str).collect();
-        self.evm.send(TAKER_KEY, &self.evm.escrow, "lock(address,address,uint128,uint64,uint64,bool,address)", &args)?;
+        self.evm.send(&accounts().taker_key, &self.evm.escrow, "lock(address,address,uint128,uint64,uint64,bool,address)", &args)?;
         Ok(lock_id(&taker(), &address))
     }
 
     /// The taker's claim of the maker's L→P lock. It reveals the secret's Polygon form, which is all the maker needs.
     fn taker_claim_polygon(&self, id: &[u8; 32], secret: &[u8; 32]) -> Res<()> {
         let s = polygon_value(secret).map_err(err)?;
-        self.evm.send(TAKER_KEY, &self.evm.escrow, "claim(bytes32,bytes32)", &[&word(id), &word(&s)])
+        self.evm.send(&accounts().taker_key, &self.evm.escrow, "claim(bytes32,bytes32)", &[&word(id), &word(&s)])
     }
 
     fn taker_refund_polygon(&self, id: &[u8; 32]) -> Res<()> {
-        self.evm.send(TAKER_KEY, &self.evm.escrow, "refund(bytes32)", &[&word(id)])
+        self.evm.send(&accounts().taker_key, &self.evm.escrow, "refund(bytes32)", &[&word(id)])
     }
 
     /// The maker's L→P lock for this point.
@@ -629,7 +763,7 @@ fn fresh_swap_terms(
         lock_height,
         liquid_amount: liquid,
         polygon_amount: polygon,
-        taker_polygon: TAKER.into(),
+        taker_polygon: taker_str(),
         gas_to: if gas_drop > 0 { Some(fresh_address()?.checksummed()) } else { None },
         gas_drop,
     };
@@ -892,7 +1026,7 @@ fn crash_between_commit_and_send(w: &mut World) -> Res<()> {
     store_adaptor_directly(w, &s)?;
     // As the engine would decide them: from the finalized block, the time clock and the block clock with its slack.
     let f = w.evm.rpc.block("finalized")?;
-    let (deadline_time, deadline_block) = (f.time + L2P_SECS, f.number + L2P_SECS + L2P_SECS / 10);
+    let (deadline_time, deadline_block) = (f.time + L2P_SECS, f.number + w.evm.blocks(L2P_SECS));
     let action = Action::LockPolygon { deadline_time, deadline_block, gas_drop: 0 };
     w.store.commit_step(&s.id, &State::LockedPolygon { deadline_time, deadline_block }, &[action]).map_err(err)?;
     let id = w.maker_lock_id(&s.point);
@@ -959,7 +1093,8 @@ fn p2l_taker_vanishes(w: &mut World) -> Res<()> {
     w.wait_state(&s.id, "the maker's automatic refund", 300, done(Outcome::Refunded))?;
     check(w.maker_holdings()? == maker_before, "the maker has its Liquid funds back")?;
     check(w.taker_refund_polygon(&id).is_err(), "the taker can't refund before its deadline")?;
-    w.evm.warp(TAKER_LOCK_SECS)?;
+    let l = w.evm.lock(&id)?;
+    w.evm.pass(l.deadline_time, l.deadline_block)?;
     w.taker_refund_polygon(&id)?;
     check(w.taker_usdt0()? == taker_before, "the taker has its USDT0 back after its deadline")?;
     Ok(())
@@ -995,12 +1130,12 @@ fn bad_locks(w: &mut World) -> Res<()> {
         w.maker.to_string(),
         USDT0.to_string(),
         (time + TAKER_LOCK_SECS).to_string(),
-        (block + TAKER_LOCK_SECS).to_string(),
+        (block + w.evm.blocks(TAKER_LOCK_SECS)).to_string(),
         "false".into(),
         ZERO.into(),
     ];
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
-    w.evm.send(TAKER_KEY, &w.evm.escrow, "lock(address,address,uint128,uint64,uint64,bool,address)", &args)?;
+    w.evm.send(&accounts().taker_key, &w.evm.escrow, "lock(address,address,uint128,uint64,uint64,bool,address)", &args)?;
     let short_leg_id = lock_id(&taker(), &lock_address(&short_leg.point));
     for (s, what) in [(&short, "a short lock"), (&near, "a lock too near its deadline"), (&elsewhere, "a lock to someone else"), (&short_leg, "a short-leg lock")] {
         w.wait_state(&s.id, &format!("giving up on {what}"), 240, |st| *st == State::Abandoned)?;
@@ -1037,7 +1172,7 @@ fn liquid_halt_extends(w: &mut World) -> Res<()> {
         e.deadline_time > before.deadline_time && e.deadline_block > before.deadline_block,
         "the taker's refund moved later, on both clocks",
     )?;
-    w.evm.warp(TAKER_LOCK_SECS + 30)?;
+    w.evm.pass(before.deadline_time, before.deadline_block)?;
     check(w.taker_refund_polygon(&id).is_err(), "the taker can't refund after the original deadline: the theft is closed")?;
 
     println!("    Liquid resumes");
@@ -1221,17 +1356,34 @@ fn build_world(root: &Path) -> World {
     let chain = Esplora::Node(node.rpc.clone());
     let genesis = BlockHash::from_str(&chain.genesis().unwrap()).unwrap();
 
-    let evm = Evm::start();
-    println!("anvil at {}: escrow {}, token {}", evm.url, evm.escrow, evm.token);
-    let signer_address = EvmAddress::parse("0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC").unwrap();
-    evm.send(SIGNER_KEY, &evm.token, "faucet(uint256)", &["1000000000"]).unwrap();
-    evm.send(TAKER_KEY, &evm.token, "faucet(uint256)", &["1000000000"]).unwrap();
-    evm.send(TAKER_KEY, &evm.token, "approve(address,uint256)", &[&evm.escrow.to_string(), &u128::MAX.to_string()]).unwrap();
+    let _ = ACCOUNTS.set(if amoy() { amoy_accounts() } else { anvil_accounts() });
+    let a = accounts();
+    let evm = if amoy() { Evm::amoy() } else { Evm::start() };
+    println!("Polygon at {}: escrow {}, token {}, {} ms a block", evm.url, evm.escrow, evm.token, evm.block_ms);
+    if evm.public() {
+        let deployer = address_of(&a.deployer_key);
+        for (who, target) in [(a.maker, AMOY_MAKER_POL), (a.taker, AMOY_TAKER_POL)] {
+            let has = evm.pol(&who).unwrap();
+            if has < target {
+                evm.pay(&a.deployer_key, &who, target - has).unwrap();
+            }
+        }
+        println!("Amoy POL: maker {}, taker {}, deployer {} left", evm.pol(&a.maker).unwrap(), evm.pol(&a.taker).unwrap(), evm.pol(&deployer).unwrap());
+    }
+    for key in [&a.maker_key, &a.taker_key] {
+        if evm.usdt0(&address_of(key)).unwrap() < 500_000_000 {
+            evm.send(key, &evm.token, "faucet(uint256)", &["1000000000"]).unwrap();
+        }
+    }
+    let allowance = cast(&["call", "--rpc-url", &evm.url, &evm.token.to_string(), "allowance(address,address)(uint256)", &a.taker.to_string(), &evm.escrow.to_string()]).unwrap();
+    if allowance.split_whitespace().next().unwrap_or("0").len() < 20 {
+        evm.send(&a.taker_key, &evm.token, "approve(address,uint256)", &[&evm.escrow.to_string(), &u128::MAX.to_string()]).unwrap();
+    }
 
-    // The signer's Polygon key is anvil's account #2, so it holds test ETH from the start.
+    // The signer's Polygon key: anvil's account #2, which holds test ETH from the start, or our Amoy test key.
     let keys = root.join("keys");
     std::fs::create_dir_all(&keys).unwrap();
-    std::fs::write(keys.join("polygon.key"), from_hex(SIGNER_KEY).unwrap()).unwrap();
+    std::fs::write(keys.join("polygon.key"), from_hex(&a.maker_key).unwrap()).unwrap();
     // Short and outside the build directory: a Unix socket path is limited to about 100 bytes.
     let private = std::env::temp_dir().join(format!("l2a-{}", std::process::id()));
     std::fs::create_dir_all(&private).unwrap();
@@ -1242,7 +1394,8 @@ fn build_world(root: &Path) -> World {
     let engine = EngineConfig {
         l2p_deadline_secs: L2P_SECS,
         p2l_gate_secs: P2L_GATE_SECS,
-        polygon_stale_secs: 10,
+        // Amoy's public RPC can pause for a few seconds. The stall scenario, which needs 10, runs only on anvil.
+        polygon_stale_secs: if amoy() { 30 } else { 10 },
         extend_after_stall_secs: 20,
         extend_within_secs: 2_000,
         extend_by_secs: 3_600,
@@ -1282,7 +1435,7 @@ fn build_world(root: &Path) -> World {
     let mut client = Client::connect(&socket).unwrap();
     let Reply::Identity { liquid_address, polygon, .. } = client.call(&Call::Identity).unwrap() else { panic!() };
     let maker = EvmAddress::parse(&polygon).unwrap();
-    assert_eq!(maker, signer_address, "the signer runs on anvil's account #2, from the key file");
+    assert_eq!(maker, a.maker, "the signer runs on the maker's key, from the key file");
 
     let pages = root.join("pages.log");
     let db = root.join("maker.db");
@@ -1305,7 +1458,7 @@ fn build_world(root: &Path) -> World {
         second_liquid: None,
         polygon: PolygonSources {
             rpc: evm.url.clone(),
-            second_rpc: None,
+            second_rpc: amoy().then(|| AMOY_SECOND_RPC.into()),
             escrow: Some(evm.escrow.checksummed()),
             token: Some(evm.token.checksummed()),
         },
@@ -1420,7 +1573,7 @@ fn side_of(chosen: &SwapTerms, gas_to: Option<&EvmAddress>) -> TakerSide {
         lock_point: chosen.lock_point.0,
         taker_key: chosen.taker_key.0,
         blinding_key: chosen.blinding_key,
-        taker_polygon: TAKER.into(),
+        taker_polygon: taker_str(),
         gas_to: gas_to.map(EvmAddress::checksummed),
     }
 }
@@ -1682,7 +1835,7 @@ fn accept_body(quote_event: String, point: LockPoint) -> Res<Body> {
         lock_point: point.to_hex(),
         taker_key: msg::hex(&key.public_key().serialize()),
         blinding_key: msg::hex(&random32()?),
-        taker_polygon: TAKER.into(),
+        taker_polygon: taker_str(),
         gas_to: Some(fresh_address()?.checksummed()),
     }))
 }
@@ -2017,12 +2170,14 @@ fn rfq_attacks(w: &mut World) -> Res<()> {
     check(!known(w, &hash)?, "and no swap was registered")?;
 
     // An accept with nowhere for the gas drop, or a taker address that is the maker's own or not an address, is refused.
-    type Spoil = fn(Accept) -> Accept;
+    let maker_own = w.maker.checksummed();
+    let bad = bad_checksum(&taker()).ok_or("the taker's address has no letters")?;
+    type Spoil<'a> = Box<dyn Fn(Accept) -> Accept + 'a>;
     let spoiled: [(&str, Spoil); 4] = [
-        ("no gas_to for a gas drop", |a| Accept { gas_to: None, ..a }),
-        ("a taker address that is the maker's own", |a| Accept { taker_polygon: "0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC".into(), ..a }),
-        ("a taker address with a bad checksum", |a| Accept { taker_polygon: "0x70997970C51812dc3A010C7d01b50e0d17dc79c8".into(), ..a }),
-        ("the zero address", |a| Accept { taker_polygon: ZERO.into(), ..a }),
+        ("no gas_to for a gas drop", Box::new(|a| Accept { gas_to: None, ..a })),
+        ("a taker address that is the maker's own", Box::new(|a| Accept { taker_polygon: maker_own.clone(), ..a })),
+        ("a taker address with a bad checksum", Box::new(|a| Accept { taker_polygon: bad.clone(), ..a })),
+        ("the zero address", Box::new(|a| Accept { taker_polygon: ZERO.into(), ..a })),
     ];
     for (what, spoil) in spoiled {
         let mut t = RawTaker::new(w)?;
@@ -2140,7 +2295,7 @@ fn rfq_attacks(w: &mut World) -> Res<()> {
         lock_point: point.0,
         taker_key: keypair_from(&random32()?)?.public_key().serialize(),
         blinding_key: random32()?,
-        taker_polygon: TAKER.into(),
+        taker_polygon: taker_str(),
         gas_to: Some(fresh_address()?.checksummed()),
     };
     let chain = w.chain.clone();
@@ -2218,6 +2373,10 @@ fn the_daemon_runs_real_swaps() {
     let mut failures = vec![];
     for (name, run) in scenarios {
         if !name.contains(&filter) {
+            continue;
+        }
+        if world.evm.public() && name.contains("stall") {
+            println!("\n==> {name}: skipped, Amoy can't be halted");
             continue;
         }
         println!("\n==> {name}");
