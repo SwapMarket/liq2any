@@ -195,6 +195,9 @@ th:nth-child(2), td.rate { width: 45%; }
 
 .faucet-steps { margin: 10px 0; padding-left: 22px; font-size: .9rem; color: var(--muted); }
 .faucet-steps li { margin: 4px 0; }
+.faucet-send { margin-top: 18px; border-top: 1px solid var(--dim); padding-top: 12px; }
+.faucet-send h3 { margin: 0 0 4px; font-size: 1rem; }
+.faucet-send .btn { margin-top: 10px; }
 
 .explorer-links { display: inline-flex; flex-wrap: wrap; gap: 0 10px; font-size: .84rem; }
 

@@ -62,6 +62,9 @@ fn calls_match_cast() {
     assert_eq!(token_call("allowance", TAKER, ESCROW).unwrap(), allowance);
     assert!(token_call("transfer", TAKER, "").is_err(), "only the reads the page needs");
     assert_eq!(build_faucet_call("100000000").unwrap(), cast(&["calldata", "faucet(uint256)", "100000000"]).unwrap());
+    let transfer = cast(&["calldata", "transfer(address,uint256)", MAKER, "100000000"]).unwrap();
+    assert_eq!(build_transfer_call(MAKER, "100000000").unwrap(), transfer);
+    assert!(build_transfer_call("0x00", "1").is_err(), "a short address is refused");
 
     // idOf(initiator, lockAddress) = keccak256(abi.encode(initiator, lockAddress)).
     let encoded = cast(&["abi-encode", "f(address,address)", MAKER, &address]).unwrap();

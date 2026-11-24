@@ -1645,6 +1645,11 @@ function settingsDialog() {
 
 // ---- Render and run ----
 // ---- The faucet, on test networks only ----
+// Made once, so what is typed survives redraws. A wallet such as Phantom doesn't list the stand-in token on a test network, so
+// it can't send it; this sends it from the connected wallet, to a maker's address for instance.
+const sendToInput = h('input', { class: 'input', id: 'send-to', placeholder: '0x… Polygon address', autocomplete: 'off', spellcheck: 'false' });
+const sendAmountInput = h('input', { class: 'input', id: 'send-amount', placeholder: 'Amount', inputmode: 'decimal', autocomplete: 'off' });
+
 function faucetView() {
   const f = NETWORK.faucet;
   const status = h('p', { class: 'note', id: 'faucet-status', role: 'status', 'data-live': '' });
@@ -1653,6 +1658,9 @@ function faucetView() {
     if (!wallet) return;
     const [units, wei] = await Promise.all([polygon.tokenBalance(NETWORK.token, wallet.address), polygon.balance(wallet.address)]);
     balance.textContent = `This wallet holds ${show(units)} ${NETWORK.tokenName} and ${pol(wei)}.`;
+    // The wallet's line above reads its balance on its own clock: after a drip or a send, now.
+    walletUsdt.at = 0;
+    refreshWalletUsdt();
   };
   showBalance().catch(() => {});
   const button = h('button', { class: 'btn', id: 'drip', onclick: () => claim() }, `Get ${f.drip} ${NETWORK.tokenName}`);
@@ -1675,6 +1683,37 @@ function faucetView() {
       button.disabled = false;
     }
   };
+  const sendStatus = h('p', { class: 'note', id: 'send-status', role: 'status', 'data-live': '' });
+  const sendButton = h('button', { class: 'btn', id: 'send', onclick: () => send() }, `Send ${NETWORK.tokenName}`);
+  const send = async () => {
+    sendButton.disabled = true;
+    try {
+      const problem = W.polygon_address_problem(sendToInput.value);
+      if (problem) throw new Error(problem);
+      const to = W.checksummed(sendToInput.value);
+      if (to.toLowerCase() === wallet.address.toLowerCase()) throw new Error('That is this wallet’s own address.');
+      if (to.toLowerCase() === NETWORK.token.toLowerCase() || to.toLowerCase() === NETWORK.escrow.toLowerCase()) {
+        throw new Error('That is a contract’s address: anything sent there is lost.');
+      }
+      const amount = units(sendAmountInput.value);
+      if (!amount) throw new Error(`Enter an amount of ${NETWORK.tokenName}, such as 50.`);
+      const held = await polygon.tokenBalance(NETWORK.token, wallet.address);
+      if (amount > held) throw new Error(`This wallet holds only ${show(held)} ${NETWORK.tokenName}.`);
+      if (await polygon.balance(wallet.address) < NETWORK.minPolWei) throw new Error('This wallet needs a little test POL first. Get some from the link above.');
+      const call = { from: wallet.address, to: NETWORK.token, data: W.build_transfer_call(to, amount.toString()) };
+      await polygon.simulate(call);
+      sendStatus.textContent = `Waiting for ${wallet.name}…`;
+      await wallet.send(call);
+      sendStatus.textContent = `${show(amount)} ${NETWORK.tokenName} are on the way to ${to}.`;
+      for (let i = 0; i < 30 && (await polygon.tokenBalance(NETWORK.token, wallet.address)) === held; i++) await new Promise((r) => setTimeout(r, 1500));
+      await showBalance();
+    } catch (err) {
+      sendStatus.textContent = '';
+      fail(err);
+    } finally {
+      sendButton.disabled = false;
+    }
+  };
   const link = (href, text) => h('a', { href, target: '_blank', rel: 'noopener noreferrer' }, text);
   return h('div', { class: 'card faucet' },
     h('h2', {}, 'Try a swap'),
@@ -1691,6 +1730,16 @@ function faucetView() {
       ? button
       : [h('button', { class: 'btn', id: 'faucet-connect', onclick: connectWallet }, 'Connect a Polygon wallet'), qrButton()],
     status,
+    wallet
+      ? h('div', { class: 'faucet-send' },
+        h('h3', {}, `Send ${NETWORK.tokenName} on`),
+        h('p', { class: 'note' }, `For a wallet that doesn’t show ${NETWORK.tokenName}, or to fund a maker. Its contract, for a wallet that can add tokens:`),
+        h('div', { class: 'addr', id: 'token-address' }, NETWORK.token),
+        h('label', { class: 'field' }, h('span', {}, 'To'), sendToInput),
+        h('label', { class: 'field' }, h('span', {}, `Amount of ${NETWORK.tokenName}`), sendAmountInput),
+        sendButton,
+        sendStatus)
+      : null,
     h('p', { class: 'note', id: 'sideswap-note' }, 'To get testnet USDt on Liquid, swap L-BTC for it in the SideSwap wallet. It’s the same asset as here:'),
     h('div', { class: 'addr' }, NETWORK.usdt));
 }

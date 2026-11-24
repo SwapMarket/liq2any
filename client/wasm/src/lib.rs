@@ -825,6 +825,14 @@ pub fn build_approve_call(spender: &str, amount_units: &str) -> Result<String, S
     Ok(data(&approve_call(&evm(spender)?, amount(amount_units)?)))
 }
 
+/// `transfer(to, amount)` on the token, for the test networks' faucet tab: a wallet that doesn't list the stand-in token can
+/// still send it on, to a maker's address for instance.
+#[wasm_bindgen]
+pub fn build_transfer_call(to: &str, amount_units: &str) -> Result<String, String> {
+    use liq2any_chain::evm::{calldata, Word};
+    Ok(data(&calldata("transfer(address,uint256)", &[Word::Address(evm(to)?), Word::Uint(amount(amount_units)?)])))
+}
+
 /// Test networks only: the stand-in token's own faucet, which mints up to 1,000 to whoever calls it.
 #[wasm_bindgen]
 pub fn build_faucet_call(amount_units: &str) -> Result<String, String> {

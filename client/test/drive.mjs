@@ -1313,9 +1313,34 @@ async function faucet() {
   step('while the wallet has a transaction to approve, the page says so, and the note goes once it is sent');
   await page.locator('#faucet-balance', { hasText: '100 tUSDT0' }).waitFor({ timeout: 60000 });
   if ((await tokenBalance(who.address)) !== 100000000n) throw new Error('the faucet gave another amount');
+  step('a new wallet gets its test tUSDT0 from the stand-in token, and one with no POL is told so');
+
+  // Sending it on, for a wallet that doesn't list the stand-in token: mistakes are refused before the wallet is asked.
+  const to = `0x${randomBytes(20).toString('hex')}`;
+  const sendTo = async (address, amount, refusal) => {
+    await page.locator('#send-to').fill(address);
+    await page.locator('#send-amount').fill(amount);
+    await page.locator('#send').click();
+    if (refusal) {
+      await page.locator('#banner:not([hidden])', { hasText: refusal }).waitFor({ timeout: 10000 });
+    }
+  };
+  if (!(await page.locator('#token-address').innerText()).includes(env.TOKEN)) throw new Error('the page should name the token contract');
+  await sendTo('0x1234', '5', "isn't a Polygon address");
+  await sendTo(env.TOKEN, '5', 'contract');
+  await sendTo(who.address, '5', 'own address');
+  await sendTo(to, '100.5', 'holds only 100');
+  await sendTo(to, 'lots', 'Enter an amount');
+  if ((await tokenBalance(who.address)) !== 100000000n) throw new Error('a refused send moved tokens');
+  await sendTo(to, '25.5', null);
+  await page.locator('#faucet-balance', { hasText: '74.5 tUSDT0' }).waitFor({ timeout: 60000 });
+  await page.locator('.wallet-balances', { hasText: '74.5 tUSDT0' }).first().waitFor({ timeout: 10000 });
+  if ((await tokenBalance(to)) !== 25500000n) throw new Error('the send delivered another amount');
+  await page.locator('.faucet-send').scrollIntoViewIfNeeded();
+  await page.screenshot({ path: path.join(shots, 'faucet-send.png'), fullPage: true });
   await checkNoErrors(page);
   await page.context().close();
-  step('a new wallet gets its test tUSDT0 from the stand-in token, and one with no POL is told so');
+  step('it sends tUSDT0 on to another address, and refuses a bad address, a contract, itself, too much, or no amount');
 }
 
 // A maker that stops publishing has to drop off a page that's already open. Moving the page's clock past every offer's
