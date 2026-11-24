@@ -2203,6 +2203,26 @@ fn rfq_p2l_release(w: &mut World) -> Res<()> {
 
 /// P→L, before the taker locks: the taker cancels, and the maker gives the swap up at once, rather than at the end of its lock
 /// window, which frees the Liquid it held for it. Once the taker has locked, a cancel is refused and the swap goes on.
+/// systemd restarts a signer that stops, and the daemon carries on with the connections it had. Each must find the new
+/// signer by itself: the main loop, the quote handler and the balance reader. A swap through all of them proves it.
+fn signer_restarts(w: &mut World) -> Res<()> {
+    // The daemon running and quoting first, so its connections are the ones the restart breaks.
+    let mut relay = Relay::connect(&w.relay_url, Duration::from_millis(200))?;
+    let offers = find_offers(&mut relay, NETWORK, Duration::from_secs(90))?;
+    check(offers.iter().any(|(k, _)| *k == w.maker_nostr), "the maker publishes its offer before the restart")?;
+    let config = w.daemon_config.parent().ok_or("no root")?.join("signer.json");
+    w._signer.child.kill().map_err(err)?;
+    w._signer.child.wait().map_err(err)?;
+    w._signer = Proc { child: Command::new(signer_binary()).arg(&config).spawn().map_err(err)? };
+    let start = Instant::now();
+    while !matches!(Client::connect(&w.signer_socket).and_then(|mut c| c.call(&Call::Identity)), Ok(Reply::Identity { .. })) {
+        check(start.elapsed() < Duration::from_secs(60), "the new signer answers")?;
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    println!("    ok: the signer was restarted under the running daemon");
+    rfq_l2p_swap(w)
+}
+
 fn rfq_p2l_cancel(w: &mut World) -> Res<()> {
     let cancel = |a: &P2lAgreed| Body::CancelAsk(msg::CancelAsk { lock_point: a.chosen.lock_point.to_hex() });
 
@@ -2515,6 +2535,7 @@ fn the_daemon_runs_real_swaps() {
         ("RFQ wrong coin refunded early", rfq_early_refund_wrong_coin),
         ("RFQ P2L release", rfq_p2l_release),
         ("RFQ P2L cancel", rfq_p2l_cancel),
+        ("signer restarts under the daemon", signer_restarts),
         ("browser client", browser_client),
     ];
     let filter = std::env::var("SCENARIO").unwrap_or_default();

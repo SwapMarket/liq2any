@@ -1526,39 +1526,108 @@ pub fn run(config_path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// The engine's end of the socket.
+/// The engine's end of the socket. A connection the signer closed, as it does when it restarts, is found when writing to it
+/// fails: the request never reached the signer, so it goes again, once, on a new connection. A failure after the request was
+/// written is returned, and the next call connects again, so a caller that keeps a `Client` recovers on its own. A caller that
+/// tries such a call again is safe too: the signer answers a repeated request with the same signed bytes.
 pub struct Client {
-    writer: UnixStream,
-    reader: BufReader<UnixStream>,
+    path: PathBuf,
+    conn: Option<(UnixStream, BufReader<UnixStream>)>,
 }
 
 impl Client {
     pub fn connect(path: &Path) -> Result<Self, String> {
-        let writer = UnixStream::connect(path).map_err(|e| format!("can't reach the signer at {}: {e}", path.display()))?;
-        let reader = BufReader::new(writer.try_clone().map_err(|e| e.to_string())?);
-        Ok(Self { writer, reader })
+        let mut client = Self { path: path.to_path_buf(), conn: None };
+        client.open()?;
+        Ok(client)
+    }
+
+    fn open(&mut self) -> Result<&mut (UnixStream, BufReader<UnixStream>), String> {
+        if self.conn.is_none() {
+            let writer = UnixStream::connect(&self.path)
+                .map_err(|e| format!("can't reach the signer at {}: {e}", self.path.display()))?;
+            let reader = BufReader::new(writer.try_clone().map_err(|e| e.to_string())?);
+            self.conn = Some((writer, reader));
+        }
+        Ok(self.conn.as_mut().expect("just opened"))
+    }
+
+    /// Write `bytes` and read one line back. Any failure, or the signer closing the connection, drops it.
+    fn exchange(&mut self, bytes: &[u8]) -> Result<String, String> {
+        let written = self.open()?.0.write_all(bytes);
+        if written.is_err() {
+            // Not delivered: a closed Unix socket refuses the write itself. Once more, on a new connection.
+            self.conn = None;
+            self.open()?.0.write_all(bytes).map_err(|e| {
+                self.conn = None;
+                e.to_string()
+            })?;
+        }
+        let (_, reader) = self.conn.as_mut().expect("open");
+        let mut line = String::new();
+        match reader.read_line(&mut line) {
+            Ok(0) => {
+                self.conn = None;
+                Err("the signer closed the connection".into())
+            }
+            Ok(_) => Ok(line),
+            Err(e) => {
+                self.conn = None;
+                Err(e.to_string())
+            }
+        }
     }
 
     pub fn call(&mut self, call: &Call) -> Result<Reply, String> {
-        let text = serde_json::to_string(call).map_err(|e| e.to_string())?;
-        writeln!(self.writer, "{text}").map_err(|e| e.to_string())?;
-        let mut line = String::new();
-        self.reader.read_line(&mut line).map_err(|e| e.to_string())?;
+        let mut text = serde_json::to_string(call).map_err(|e| e.to_string())?;
+        text.push('\n');
+        let line = self.exchange(text.as_bytes())?;
         serde_json::from_str(&line).map_err(|e| e.to_string())
     }
 
     /// Send raw bytes, for testing how the signer handles bad input.
     pub fn call_raw(&mut self, bytes: &[u8]) -> Result<String, String> {
-        self.writer.write_all(bytes).map_err(|e| e.to_string())?;
-        let mut line = String::new();
-        self.reader.read_line(&mut line).map_err(|e| e.to_string())?;
-        Ok(line)
+        self.exchange(bytes)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A signer that restarts drops every connection. The client's next call must reach the new one, not fail for ever.
+    #[test]
+    fn a_client_reconnects_after_the_signer_restarts() {
+        use std::io::BufRead;
+        use std::os::unix::net::UnixListener;
+        let dir = std::env::temp_dir().join(format!("liq2any-client-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("s.sock");
+        let _ = std::fs::remove_file(&path);
+        let listener = UnixListener::bind(&path).unwrap();
+        let (closed, wait_closed) = std::sync::mpsc::channel();
+        // Each connection answers one request, then closes, as a restarting signer does.
+        let server = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let (stream, _) = listener.accept().unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                let mut w = stream;
+                writeln!(w, "{}", serde_json::to_string(&Reply::Held(true)).unwrap()).unwrap();
+                drop((w, reader));
+                closed.send(()).unwrap();
+            }
+        });
+        let mut client = Client::connect(&path).unwrap();
+        let ask = Call::AdaptorHeld { swap_id: [0; 32] };
+        assert_eq!(client.call(&ask), Ok(Reply::Held(true)));
+        wait_closed.recv().unwrap();
+        // The first connection is gone. The write finds that out, so the call goes again on a new one.
+        assert_eq!(client.call(&ask), Ok(Reply::Held(true)), "a call after the signer restarted reaches the new one");
+        server.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn only_our_own_vault_is_used() {

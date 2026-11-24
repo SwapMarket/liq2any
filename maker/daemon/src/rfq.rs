@@ -5,6 +5,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -143,6 +144,7 @@ pub struct Handler {
 
 /// Often enough for an offer, and rarely enough for a public API's rate limit.
 const BALANCES_EVERY: Duration = Duration::from_secs(120);
+const BALANCES_RETRY: Duration = Duration::from_secs(5);
 
 fn now_secs() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())
@@ -658,6 +660,7 @@ fn run_relay(
     handler: Arc<Mutex<Handler>>,
     pubkey: PublicKey,
     offer_every: Duration,
+    balances_changed: Arc<AtomicU64>,
     outgoing: Receiver<Event>,
 ) {
     loop {
@@ -676,6 +679,7 @@ fn run_relay(
             continue;
         }
         let mut last_offer: Option<Instant> = None;
+        let mut offered_for = balances_changed.load(Ordering::SeqCst);
         // Whatever piled up during an outage is stale, and the engine will ask again.
         while outgoing.try_recv().is_ok() {}
         'connected: loop {
@@ -685,7 +689,9 @@ fn run_relay(
                     break 'connected;
                 }
             }
-            if last_offer.is_none_or(|t| t.elapsed() >= offer_every) {
+            let balances_now = balances_changed.load(Ordering::SeqCst);
+            if last_offer.is_none_or(|t| t.elapsed() >= offer_every) || balances_now != offered_for {
+                offered_for = balances_now;
                 let offer = handler.lock().map_err(|_| "poisoned".to_string()).and_then(|mut h| h.offer(now_secs()));
                 match offer.and_then(|o| relay.publish(&o)) {
                     Ok(()) => last_offer = Some(Instant::now()),
@@ -716,18 +722,23 @@ fn run_relay(
     }
 }
 
-/// One read of what we hold. A failure reads as nothing, so we don't quote on stale funds.
-fn read_balances(signer: &mut Client, balances: &Mutex<(u64, u64)>) {
-    let read = match signer.call(&Call::Capacity) {
-        Ok(Reply::Capacity { polygon_units, liquid_units }) => (polygon_units, liquid_units / 100),
+/// One read of what we hold. A failure reads as nothing, so we don't quote on stale funds. A change bumps `changed`, which has
+/// every relay publish a new offer at once, rather than at its next turn: funds just arrived, or ran out.
+fn read_balances(signer: &mut Client, balances: &Mutex<(u64, u64)>, changed: &AtomicU64) -> bool {
+    let (read, ok) = match signer.call(&Call::Capacity) {
+        Ok(Reply::Capacity { polygon_units, liquid_units }) => ((polygon_units, liquid_units / 100), true),
         other => {
             eprintln!("rfq: could not read our balances: {other:?}");
-            (0, 0)
+            ((0, 0), false)
         }
     };
     if let Ok(mut b) = balances.lock() {
+        if *b != read {
+            changed.fetch_add(1, Ordering::SeqCst);
+        }
         *b = read;
     }
+    ok
 }
 
 /// Start answering on every configured relay.
@@ -740,17 +751,24 @@ pub fn start(cfg: RfqConfig, maker: &crate::Config) -> Result<(PublicKey, Outbox
     // Once before any relay starts, so the first offer is right, and then in the background, on a connection of its own.
     let mut reader = Client::connect(&maker.signer_socket)?;
     let balances = handler.balances.clone();
-    read_balances(&mut reader, &balances);
-    std::thread::spawn(move || loop {
-        std::thread::sleep(BALANCES_EVERY);
-        read_balances(&mut reader, &balances);
+    let changed = Arc::new(AtomicU64::new(0));
+    read_balances(&mut reader, &balances, &changed);
+    let bump = changed.clone();
+    // A failed read, such as the first after the signer restarts, is tried again soon, so the offer isn't left at nothing.
+    std::thread::spawn(move || {
+        let mut wait = BALANCES_EVERY;
+        loop {
+            std::thread::sleep(wait);
+            wait = if read_balances(&mut reader, &balances, &bump) { BALANCES_EVERY } else { BALANCES_RETRY };
+        }
     });
     let handler = Arc::new(Mutex::new(handler));
     for url in relays {
         let h = handler.clone();
         let (send, receive) = channel();
         outbox.relays.push(send);
-        std::thread::spawn(move || run_relay(url, h, pubkey, every, receive));
+        let changed = changed.clone();
+        std::thread::spawn(move || run_relay(url, h, pubkey, every, changed, receive));
     }
     Ok((pubkey, outbox))
 }
