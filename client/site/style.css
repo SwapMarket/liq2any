@@ -244,6 +244,8 @@ body.menu-open { overflow: hidden; }
 #wallet-wait strong { font-size: 1.1rem; }
 #wallet-wait .btn { grid-column: 1 / -1; margin-top: 8px; }
 #wallet-wait p { margin: 0; color: var(--muted); font-size: .9rem; }
+#wallet-wait strong, #wallet-wait p { grid-column: 2; }
+#wallet-wait p.wallet-what { color: var(--text); }
 .step-time { margin-left: .6em; font-size: .82em; color: var(--muted); font-variant-numeric: tabular-nums; }
 .step-time.live { color: var(--primary); }
 .facts.addresses { margin-top: 14px; padding-top: 10px; border-top: 1px solid var(--edge); }

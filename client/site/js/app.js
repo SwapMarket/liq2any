@@ -420,14 +420,16 @@ const refusedByUser = (e) => e?.code === 4001 || /reject|denied|declin|cancel/i.
 function watched(w, phone) {
   return {
     ...w,
-    send: async (call) => {
+    // `what`, if given, says which prompt this is and what it does: { title, detail }.
+    send: async (call, what) => {
       // A wallet that never answers would hold this swap's steps for ever, its checks included. An EVM wallet sends what it is
       // asked to itself, so after stopping, approving in the wallet still sends it. The page reads the chain, and carries on.
       let stop;
       const stopped = new Promise((_, reject) => { stop = () => reject(new Error(`Stopped waiting for ${w.name}. If you approve it there later, it is still sent, and this page will see it.`)); });
       const note = h('div', { id: 'wallet-wait', role: 'alertdialog', 'aria-live': 'assertive' },
         h('div', { class: 'spinner' }),
-        h('strong', {}, `Approve in ${w.name}`),
+        h('strong', {}, what?.title ? `${what.title}, in ${w.name}` : `Approve in ${w.name}`),
+        what?.detail && h('p', { class: 'wallet-what' }, what.detail),
         h('p', {}, phone
           ? `The request is waiting in ${w.name} on your phone. Open the app to approve it. Nothing happens on this page until you do.`
           : `${w.name} has a transaction for you to approve, in its own window. If you don't see it, open ${w.name} from the browser's toolbar.`),
@@ -1305,9 +1307,11 @@ function swapBody(s) {
       return [
         h('p', { class: 'note' }, `Lock ${show(s.terms.polygon_amount)} ${from}. The maker then locks ${show(BigInt(s.terms.liquid_amount) / 100n)} ${to} for you.`),
         walletView(),
-        h('p', { class: 'note' }, `Your wallet asks twice the first time: once to let the escrow take ${NETWORK.tokenName}, then for the lock.`),
-        stepButton(s, 'lock', 'Lock on Polygon', !wallet, (fresh) => engine.lockOnPolygon(fresh), 'Checking before the lock…'),
-        pressed.has(s.id) && s.status && h('p', { class: 'status' }, s.status),
+        h('p', { class: 'note lock-explained' }, `${wallet?.name ?? 'Your wallet'} asks up to twice. First, approve: it lets the escrow take ${show(s.terms.polygon_amount)} ${from} from this wallet, for this swap, and moves nothing. Then, lock: it moves them into the escrow, where only this swap can use them. If the maker doesn't lock your ${to}, they come back to you.`),
+        // Once pressed, one line saying which prompt the wallet shows now.
+        pressed.has(s.id)
+          ? h('p', { class: 'status spin pressed lock-status' }, s.status || pressed.get(s.id))
+          : stepButton(s, 'lock', 'Lock on Polygon', !wallet, (fresh) => engine.lockOnPolygon(fresh), 'Checking before the lock…'),
       ];
     case 'await_maker':
       return [

@@ -573,11 +573,23 @@ async function p2l() {
   const to = await walletCli('getnewaddress');
   const file = await startSwap(page, true, to);
   await page.locator('.lock').waitFor();
+  if (!/asks up to twice\. First, approve: .* moves nothing\. Then, lock:/.test(await page.locator('.lock-explained').innerText())) throw new Error('the page should say what each wallet prompt does');
   await page.screenshot({ path: path.join(shots, 'lock.png') });
   const before = await tokenBalance(ownerAddress);
+  // A wallet slow to answer, so each prompt's line can be seen while it waits.
+  await page.evaluate(() => localStorage.setItem('test.signDelay', '3000'));
   await page.locator('.lock').click();
+  const status = page.locator('.lock-status');
+  await status.filter({ hasText: /^Step 1 of 2, in Test Wallet: approve\. It lets the escrow take [\d.]+ tUSDT0 from this wallet when you lock\. Nothing moves yet\.$/ }).waitFor({ timeout: 30000 });
+  await page.locator('#wallet-wait strong', { hasText: 'Step 1 of 2: approve, in Test Wallet' }).waitFor({ timeout: 10000 });
+  await page.screenshot({ path: path.join(shots, 'lock-approve.png') });
+  await status.filter({ hasText: /^Step 2 of 2, in Test Wallet: lock\. It moves [\d.]+ tUSDT0 into the escrow for this swap\./ }).waitFor({ timeout: 30000 });
+  await page.locator('#wallet-wait strong', { hasText: 'Step 2 of 2: lock, in Test Wallet' }).waitFor({ timeout: 10000 });
+  await page.screenshot({ path: path.join(shots, 'lock-lock.png') });
+  if (await page.locator('.status', { hasText: 'Checking before the lock' }).count()) throw new Error('the checking line still shows while the wallet asks');
+  await page.evaluate(() => localStorage.removeItem('test.signDelay'));
   await page.locator('.confirmations', { hasText: /Locked\. Waiting for the maker|The maker locked on Liquid: [0-2]\/2 confirmations/ }).waitFor({ timeout: 60000 });
-  step('approved the escrow, then locked on Polygon');
+  step('approved the escrow, then locked on Polygon, with one line saying what each prompt does');
   loseBroadcastReply = true;
   await waitState(page, 'done');
   if (loseBroadcastReply) throw new Error('the claim was never published through the page');

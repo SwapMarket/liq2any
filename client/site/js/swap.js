@@ -5,6 +5,13 @@ import { NETWORK, confirmationsFor } from './config.js';
 import { log } from './logs.js';
 import { saveSwap } from './store.js';
 
+// USDT units of 10^-6 as text, trailing zeros dropped: 100000 is "0.1".
+const showUnits = (u) => {
+  const v = BigInt(u);
+  const frac = (v % 1000000n).toString().padStart(6, '0').replace(/0+$/, '');
+  return `${v / 1000000n}${frac ? `.${frac}` : ''}`;
+};
+
 const now = () => Math.floor(Date.now() / 1000);
 
 export const rulesJson = (maxSpread = NETWORK.maxSpreadBps) => JSON.stringify({
@@ -301,15 +308,23 @@ export class Engine {
     if (!wallet) throw new Error('Connect a Polygon wallet first.');
     if (s.state !== 'lock') return;
     if (!same(wallet.address, s.polygon_owner)) throw new Error(`Connect the wallet this swap was agreed for, ${s.polygon_owner}.`);
+    // Nothing from an earlier try may show as what the wallet asks now.
+    this.set(s, { status: '' });
     if (await this.lock(s, 'latest')) return;
     if (await this.esplora[0].tip() > s.terms.h_accept + 15) throw new Error('The time to lock has passed, so the maker would no longer fill this. Nothing was sent.');
     const amount = BigInt(s.terms.polygon_amount);
     if (await this.polygon.tokenBalance(NETWORK.token, wallet.address) < amount) throw new Error(`This wallet holds too little ${NETWORK.tokenName}.`);
     if (await this.polygon.balance(wallet.address) < NETWORK.minPolWei) throw new Error('This wallet needs a little POL for the network fee.');
-    if (await this.polygon.allowance(NETWORK.token, wallet.address, NETWORK.escrow) < amount) {
-      this.set(s, { status: `Waiting for ${wallet.name} to let the escrow take ${NETWORK.tokenName}…` });
+    // Each prompt says what it does, because a wallet shows only a contract call it can't explain.
+    const sum = `${showUnits(amount)} ${NETWORK.tokenName}`;
+    const approving = await this.polygon.allowance(NETWORK.token, wallet.address, NETWORK.escrow) < amount;
+    if (approving) {
+      const detail = `It lets the escrow take ${sum} from this wallet when you lock. Nothing moves yet.`;
+      this.set(s, { status: `Step 1 of 2, in ${wallet.name}: approve. ${detail}` });
       const approve = { from: wallet.address, to: NETWORK.token, data: W.build_approve_call(NETWORK.escrow, amount.toString()) };
-      await this.mined(await wallet.send(approve), 'approval');
+      const sent = await wallet.send(approve, { title: 'Step 1 of 2: approve', detail });
+      this.set(s, { status: 'Step 1 of 2: approved. Waiting for Polygon to include it, a few seconds…' });
+      await this.mined(sent, 'approval');
     }
     // Long enough on both clocks for the maker's check, and the time it takes to lock and be seen.
     const head = await this.polygon.block('latest');
@@ -318,8 +333,9 @@ export class Engine {
     const data = W.build_lock_call(s.secrets.lock_address, s.terms.maker_polygon, amount.toString(), BigInt(head.time + secs), BigInt(head.number + blocks));
     const call = { from: wallet.address, to: NETWORK.escrow, data };
     await this.polygon.simulate(call);
-    this.set(s, { status: `Waiting for ${wallet.name} to send the lock…` });
-    const hash = await wallet.send(call);
+    const detail = `It moves ${sum} into the escrow for this swap. The maker gets it only after locking your side; otherwise it comes back to you.`;
+    this.set(s, { status: `${approving ? 'Step 2 of 2, in' : 'In'} ${wallet.name}: lock. ${detail}` });
+    const hash = await wallet.send(call, { title: approving ? 'Step 2 of 2: lock' : 'Lock', detail });
     this.set(s, { state: 'await_maker', status: '', lock_hash: hash });
   }
 
