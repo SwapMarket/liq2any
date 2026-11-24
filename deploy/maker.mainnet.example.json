@@ -1,0 +1,86 @@
+{
+ "network": "mainnet",
+ "db": "maker.db",
+ "signer_socket": "run/signer.sock",
+ "pages": "pages.log",
+ "engine": {
+  "confirmations": 1,
+  "large_above": 100000000,
+  "confirmations_large": 2,
+  "max_per_swap": 1000000000,
+  "max_open_l2p": 3000000000,
+  "max_open_p2l": 3000000000,
+  "l2p_gate_blocks": 390,
+  "l2p_fund_window_blocks": 30,
+  "l2p_deadline_secs": 10800,
+  "short_leg_block_slack_pct": 10,
+  "max_gas_drop": 500000000000000000,
+  "p2l_gate_secs": 23400,
+  "p2l_lock_window_blocks": 30,
+  "liquid_stale_secs": 600,
+  "polygon_stale_secs": 60,
+  "polygon_max_lag_blocks": 100,
+  "polygon_block_ms_min": 500,
+  "polygon_block_ms_max": 5000,
+  "extend_after_stall_secs": 3600,
+  "extend_within_secs": 3600,
+  "extend_by_secs": 604800,
+  "max_extension_blocks": 604800,
+  "urgent_blocks": 60
+ },
+ "liquid": {
+  "Esplora": "https://blockstream.info/liquid/api"
+ },
+ "second_liquid": {
+  "Esplora": "https://liquid.network/api"
+ },
+ "polygon": {
+  "rpc": "https://polygon-bor-rpc.publicnode.com",
+  "second_rpc": "https://polygon.drpc.org"
+ },
+ "tick_millis": 10000,
+ "retry_secs": 60,
+ "regtest_assets": null,
+ "rfq": {
+  "nostr_key": "keys/nostr.key",
+  "relays": [
+   "wss://relay.primal.net",
+   "wss://relay.coinos.pro"
+  ],
+  "network": "mainnet",
+  "pairs": [
+   {
+    "from": "liquid",
+    "to": "polygon",
+    "min": 1000000,
+    "max": 1000000000,
+    "prices": [
+     { "up_to": "25000000", "bps": 40 },
+     { "up_to": "100000000", "bps": 30 },
+     { "up_to": "1000000000", "bps": 30 }
+    ],
+    "lock_blocks": 480,
+    "gas_drop": "100000000000000000"
+   },
+   {
+    "from": "polygon",
+    "to": "liquid",
+    "min": 1000000,
+    "max": 1000000000,
+    "prices": [
+     { "up_to": "25000000", "bps": 50 },
+     { "up_to": "100000000", "bps": 40 },
+     { "up_to": "1000000000", "bps": 40 }
+    ],
+    "lock_blocks": 90
+   }
+  ],
+  "quote_secs": 60,
+  "offer_every_secs": 300,
+  "offer_ttl_secs": 660,
+  "max_requests_per_sender": 60,
+  "max_requests_per_window": 2000,
+  "window_secs": 300,
+  "max_negotiations": 500
+ }
+}

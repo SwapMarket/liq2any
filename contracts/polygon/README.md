@@ -60,7 +60,16 @@ The constructor takes the token and the block counterparts of 14 days and 7 days
 - Polygon mainnet, 1.5 s blocks: `806400 403200`;
 - Amoy, 1.0 s blocks: `1209600 604800`.
 
-The user deploys mainnet, once, and it never changes (decision P3).
+The user deploys mainnet, once, and it never changes (decision P3), with `scripts/deploy-polygon.sh` and the user's own signer:
+
+```bash
+scripts/deploy-polygon.sh --ledger            # or --trezor, or --account NAME for a cast keystore
+```
+
+It refuses a key on the command line, a chain other than 137, uncommitted contract changes, and a commit not on `origin/main`. It
+asks before sending, then checks the deployed code byte for byte against the build, that the escrow names USDT0 and its block
+limits, and writes `deployments/polygon.json`. About 1.6 M gas: under 0.5 POL at 276 gwei (2026-11-25). Tried on an `anvil` fork
+of mainnet with anvil's public test key in a throwaway keystore.
 
 A maker vault takes the escrow, the cold owner, the hot operator, the window in seconds and the cap in token units, for example
 `MakerVault(escrow, owner, operator, 86400, 1000e6)`. The owner then funds it with a plain USDT0 transfer.

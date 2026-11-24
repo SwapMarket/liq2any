@@ -1,0 +1,43 @@
+{
+ "network": "mainnet",
+ "socket": "run/signer.sock",
+ "ledger": "signer.db",
+ "keys_dir": "keys",
+ "liquid": {
+  "Esplora": "https://blockstream.info/liquid/api"
+ },
+ "polygon": {
+  "rpc": "https://polygon-bor-rpc.publicnode.com",
+  "fees": {
+   "priority_floor_gwei": 30,
+   "max_fee_cap_gwei": 3000
+  }
+ },
+ "limits": {
+  "max_per_swap": 1000000000,
+  "window_secs": 3600,
+  "max_per_window": 3000000000,
+  "confirmations": 1,
+  "large_above": 100000000,
+  "confirmations_large": 2,
+  "p2l_gate_secs": 23400,
+  "l2p_gate_blocks": 390,
+  "l2p_max_deadline_secs": 10800,
+  "short_leg_block_slack_pct": 10,
+  "max_gas_drop": 500000000000000000,
+  "p2l_min_blocks": 30,
+  "p2l_max_blocks": 120,
+  "extend_after_stall_secs": 3600,
+  "extend_by_secs": 604800,
+  "max_extension_blocks": 604800,
+  "polygon_block_ms_min": 500,
+  "polygon_block_ms_max": 5000
+ },
+ "regtest_assets": null,
+ "fee_coin_sats": 30,
+ "fresh_addresses": false,
+ "withdraw_to": {
+  "liquid": null,
+  "polygon": null
+ }
+}

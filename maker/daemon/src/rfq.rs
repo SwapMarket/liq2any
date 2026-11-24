@@ -77,7 +77,7 @@ impl RfqConfig {
 }
 
 /// Why a pair list can't be used, or `None`. The engine's limits come first, because they bind every swap.
-fn pairs_problem(pairs: &[PairConfig], engine: &engine::Config) -> Option<String> {
+pub(crate) fn pairs_problem(pairs: &[PairConfig], engine: &engine::Config) -> Option<String> {
     let offered: Vec<PairOffer> = pairs
         .iter()
         .map(|p| PairOffer {

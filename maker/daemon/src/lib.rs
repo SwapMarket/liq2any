@@ -1011,6 +1011,23 @@ mod tests {
         assert!(try_loaded("pager-no-relay", with(npub, "[]")).is_err(), "and so does nowhere to send");
     }
 
+    /// The mainnet example loads, offers within mainnet's cap per swap, pins nothing of a test network's, and its pairs pass the
+    /// same check the maker runs at startup.
+    #[test]
+    fn the_mainnet_example_is_usable_as_it_is() {
+        let dir = std::env::temp_dir().join(format!("liq2any-config-{}-mainnet", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("maker.json");
+        std::fs::write(&path, include_str!("../../../deploy/maker.mainnet.example.json")).unwrap();
+        let cfg = load_config(&path).unwrap();
+        assert_eq!(cfg.network, "mainnet");
+        assert_eq!((cfg.polygon.escrow.as_deref(), cfg.polygon.token.as_deref()), (None, None), "mainnet's are pinned in the code");
+        assert!(cfg.engine.max_per_swap <= liq2any_chain::liquid::MAINNET_MAX_PER_SWAP);
+        let rfq = cfg.rfq.as_ref().unwrap();
+        assert_eq!(rfq.network, "mainnet");
+        assert_eq!(rfq::pairs_problem(&rfq.pairs, &cfg.engine), None);
+    }
+
     #[test]
     fn the_example_stays_inside_the_folder_it_is_copied_to() {
         for folder in ["first", "second"] {

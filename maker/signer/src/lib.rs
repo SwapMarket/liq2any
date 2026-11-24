@@ -1664,6 +1664,18 @@ mod tests {
     }
 
     #[test]
+    fn the_mainnet_example_pins_nothing_of_a_test_network() {
+        let dir = std::env::temp_dir().join(format!("liq2any-signer-config-mainnet-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("signer.json");
+        std::fs::write(&path, include_str!("../../../deploy/signer.mainnet.example.json")).unwrap();
+        let cfg = load_config(&path).unwrap();
+        assert_eq!(cfg.network, "mainnet");
+        assert_eq!((cfg.polygon.escrow, cfg.polygon.token, cfg.regtest_assets), (None, None, None));
+        assert!(cfg.limits.max_per_swap <= liq2any_chain::liquid::MAINNET_MAX_PER_SWAP);
+    }
+
+    #[test]
     fn a_pol_withdrawal_leaves_enough_for_p2l_claims() {
         assert!(pol_left_is_enough(0, 0).is_ok(), "with nothing to claim, all of it may go");
         assert!(pol_left_is_enough(1, POL_KEPT_PER_P2L_LOCK).is_ok());
